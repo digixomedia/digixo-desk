@@ -55,6 +55,13 @@ function createServiceClient() {
 interface ApiKeyInfo {
   key_id: string;
   key_name: string;
+  permissions: string[];
+}
+
+function hasPermission(apiKey: ApiKeyInfo | null, permission: string): boolean {
+  if (!apiKey) return false;
+  if (apiKey.permissions.includes("*")) return true;
+  return apiKey.permissions.includes(permission);
 }
 
 async function authenticate(req: Request, supabase: ReturnType<typeof createClient>): Promise<ApiKeyInfo | null> {
@@ -76,7 +83,7 @@ async function authenticate(req: Request, supabase: ReturnType<typeof createClie
   // Touch last_used_at (fire and forget)
   supabase.rpc("touch_api_key_last_used", { p_key_id: data.key_id }).then(() => {});
 
-  return { key_id: data.key_id, key_name: data.key_name };
+  return { key_id: data.key_id, key_name: data.key_name, permissions: data.permissions ?? ["*"] };
 }
 
 // =========================================================
@@ -139,7 +146,7 @@ function handleHealth(requestId: string): Response {
 
 // --- Whoami ---
 function handleWhoami(apiKey: ApiKeyInfo, requestId: string): Response {
-  return successResponse({ key_id: apiKey.key_id, key_name: apiKey.key_name, access: "full_admin" });
+  return successResponse({ key_id: apiKey.key_id, key_name: apiKey.key_name, permissions: apiKey.permissions, access: apiKey.permissions.includes("*") ? "full_admin" : "limited" });
 }
 
 // --- Dashboard ---
@@ -774,6 +781,7 @@ interface RouteMatch {
   handler: (supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string, pathParam?: string) => Promise<Response>;
   pathParam?: string;
   requiresAuth: boolean;
+  requiredPermission?: string;
 }
 
 function matchRoute(path: string, method: string): RouteMatch | null {
@@ -792,46 +800,46 @@ function matchRoute(path: string, method: string): RouteMatch | null {
 
   // Sales
   if (path === "/v1/sales" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleSalesList(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "sales:read", handler: async (s, r, _a, requestId) => handleSalesList(s, r, requestId) };
   }
   if (path === "/v1/sales" && method === "POST") {
-    return { requiresAuth: true, handler: async (s, r, a, requestId) => handleSaleCreate(s, r, a, requestId) };
+    return { requiresAuth: true, requiredPermission: "sales:write", handler: async (s, r, a, requestId) => handleSaleCreate(s, r, a, requestId) };
   }
   const saleMatch = path.match(/^\/v1\/sales\/([^/]+)$/);
   if (saleMatch && method === "GET") {
-    return { requiresAuth: true, pathParam: saleMatch[1], handler: async (s, _r, _a, requestId, id) => handleSaleDetail(s, id!, requestId) };
+    return { requiresAuth: true, requiredPermission: "sales:read", pathParam: saleMatch[1], handler: async (s, _r, _a, requestId, id) => handleSaleDetail(s, id!, requestId) };
   }
   if (saleMatch && method === "PATCH") {
-    return { requiresAuth: true, pathParam: saleMatch[1], handler: async (s, r, _a, requestId, id) => handleFulfilmentUpdate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "sales:write", pathParam: saleMatch[1], handler: async (s, r, _a, requestId, id) => handleFulfilmentUpdate(s, id!, r, requestId) };
   }
 
   // Payments
   const paymentMatch = path.match(/^\/v1\/sales\/([^/]+)\/payments$/);
   if (paymentMatch && method === "POST") {
-    return { requiresAuth: true, pathParam: paymentMatch[1], handler: async (s, r, _a, requestId, id) => handlePaymentCreate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "payments:write", pathParam: paymentMatch[1], handler: async (s, r, _a, requestId, id) => handlePaymentCreate(s, id!, r, requestId) };
   }
 
   // Customers
   if (path === "/v1/customers" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleCustomersList(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "customers:read", handler: async (s, r, _a, requestId) => handleCustomersList(s, r, requestId) };
   }
   if (path === "/v1/customers" && method === "POST") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleCustomerCreate(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "customers:write", handler: async (s, r, _a, requestId) => handleCustomerCreate(s, r, requestId) };
   }
   const customerMatch = path.match(/^\/v1\/customers\/([^/]+)$/);
   if (customerMatch && method === "GET") {
-    return { requiresAuth: true, pathParam: customerMatch[1], handler: async (s, _r, _a, requestId, id) => handleCustomerDetail(s, id!, requestId) };
+    return { requiresAuth: true, requiredPermission: "customers:read", pathParam: customerMatch[1], handler: async (s, _r, _a, requestId, id) => handleCustomerDetail(s, id!, requestId) };
   }
   if (customerMatch && method === "PATCH") {
-    return { requiresAuth: true, pathParam: customerMatch[1], handler: async (s, r, _a, requestId, id) => handleCustomerUpdate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "customers:write", pathParam: customerMatch[1], handler: async (s, r, _a, requestId, id) => handleCustomerUpdate(s, id!, r, requestId) };
   }
 
   // Products
   if (path === "/v1/products" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleProductsList(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "products:read", handler: async (s, r, _a, requestId) => handleProductsList(s, r, requestId) };
   }
   if (path === "/v1/products" && method === "POST") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleProductCreate(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "products:write", handler: async (s, r, _a, requestId) => handleProductCreate(s, r, requestId) };
   }
   const productMatch = path.match(/^\/v1\/products\/([^/]+)$/);
   if (productMatch && method === "PATCH") {
@@ -915,6 +923,13 @@ Deno.serve(async (req: Request) => {
       if (!apiKey) {
         const resp = errorResponse("UNAUTHORIZED", "Invalid or missing API key", requestId, 401);
         await logRequest(supabase, requestId, null, path, req.method, 401, ip, Date.now() - startTime, "Authentication failed");
+        return resp;
+      }
+
+      // Permission check
+      if (routeMatch.requiredPermission && !hasPermission(apiKey, routeMatch.requiredPermission)) {
+        const resp = errorResponse("FORBIDDEN", `This API key lacks the '${routeMatch.requiredPermission}' permission`, requestId, 403);
+        await logRequest(supabase, requestId, apiKey, path, req.method, 403, ip, Date.now() - startTime, "Permission denied");
         return resp;
       }
 

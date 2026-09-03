@@ -19,8 +19,9 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
-import { UserCheck, Package, CreditCard, Check, Search, Calendar } from "lucide-react";
+import { UserCheck, Package, CreditCard, Check, Search, Calendar, Zap } from "lucide-react";
 import { normalizePhone, formatMoney, formatDate } from "@/lib/format";
+import { getSettings } from "@/pages/settings";
 import type { Customer, Product, ProductPlan, FulfilmentStatus, PurchaseType } from "@/lib/types";
 
 export function NewSalePage() {
@@ -39,6 +40,14 @@ export function NewSalePage() {
   const [newEmail, setNewEmail] = useState("");
   const [newType, setNewType] = useState("retail");
   const [newSource, setNewSource] = useState("WhatsApp");
+
+  // Pre-fill from saved settings
+  useEffect(() => {
+    const s = getSettings();
+    setNewType(s.defaultCustomerType);
+    setNewSource(s.defaultAcquisitionSource);
+    setPaymentMethod(s.defaultPaymentMethod);
+  }, []);
   const [phoneSearched, setPhoneSearched] = useState(false);
 
   // Step 2: Product & Prices combined
@@ -559,7 +568,12 @@ export function NewSalePage() {
                     </div>
                     <div className="flex flex-col gap-1.5">
                       <Label htmlFor="amount-received">Amount Received</Label>
-                      <Input id="amount-received" type="number" min={0} step="0.01" value={amountReceived} onChange={(e) => setAmountReceived(e.target.value)} placeholder="0.00" />
+                      <div className="flex gap-2">
+                        <Input id="amount-received" type="number" min={0} step="0.01" value={amountReceived} onChange={(e) => setAmountReceived(e.target.value)} placeholder="0.00" />
+                        <Button type="button" size="sm" variant="outline" className="shrink-0 gap-1" onClick={() => setAmountReceived(String(selling))} disabled={selling <= 0}>
+                          <Zap className="h-3.5 w-3.5" /> Full
+                        </Button>
+                      </div>
                       {(() => {
                         const received = parseFloat(amountReceived) || 0;
                         const derived = received >= selling && selling > 0 ? "Paid" : received > 0 ? "Partial" : "Pending";

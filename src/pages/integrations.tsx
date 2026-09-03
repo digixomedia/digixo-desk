@@ -40,6 +40,7 @@ import {
   ChevronRight,
   Terminal,
   Shield,
+  Lock,
 } from "lucide-react";
 import { formatDate, formatDateTime } from "@/lib/format";
 import {
@@ -64,14 +65,35 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
   const [expiry, setExpiry] = useState("");
   const [newKey, setNewKey] = useState<CreateApiKeyResult | null>(null);
   const [copied, setCopied] = useState(false);
+  const [permMode, setPermMode] = useState<"full" | "limited">("full");
+  const [permSalesRead, setPermSalesRead] = useState(true);
+  const [permSalesWrite, setPermSalesWrite] = useState(false);
+  const [permCustomersRead, setPermCustomersRead] = useState(true);
+  const [permCustomersWrite, setPermCustomersWrite] = useState(false);
+  const [permProductsRead, setPermProductsRead] = useState(true);
+  const [permPaymentsWrite, setPermPaymentsWrite] = useState(false);
+  const [permDashboard, setPermDashboard] = useState(true);
 
   const createKey = useMutation({
     mutationFn: async () => {
       if (!name.trim()) throw new Error("Key name is required");
       const expiresAt = expiry ? new Date(expiry + "T23:59:59").toISOString() : null;
+      const permissions = permMode === "full"
+        ? ["*"]
+        : [
+            ...(permSalesRead ? ["sales:read"] : []),
+            ...(permSalesWrite ? ["sales:write"] : []),
+            ...(permCustomersRead ? ["customers:read"] : []),
+            ...(permCustomersWrite ? ["customers:write"] : []),
+            ...(permProductsRead ? ["products:read"] : []),
+            ...(permPaymentsWrite ? ["payments:write"] : []),
+            ...(permDashboard ? ["dashboard:read"] : []),
+          ];
+      if (permissions.length === 0) throw new Error("Select at least one permission");
       const { data, error } = await supabase.rpc("create_api_key", {
         p_name: name.trim(),
         p_expires_at: expiresAt,
+        p_permissions: permissions,
       });
       if (error) throw error;
       return data as CreateApiKeyResult;
@@ -89,6 +111,7 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
     setName("");
     setExpiry("");
     setCopied(false);
+    setPermMode("full");
     onOpenChange(false);
   };
 
@@ -135,7 +158,7 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
             <DialogHeader>
               <DialogTitle>Generate New API Key</DialogTitle>
               <DialogDescription>
-                Create a key for an AI agent or integration. Every key has full admin access to all DigiXO Desk resources.
+                Create a key for an AI agent or integration. Choose full admin or limited permissions.
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-4">
@@ -158,11 +181,37 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
                 />
                 <p className="text-xs text-muted-foreground">Leave blank for no expiry.</p>
               </div>
-              <div className="flex items-start gap-2 rounded-lg border bg-muted/30 p-3">
-                <Shield className="h-4 w-4 shrink-0 text-primary" />
-                <p className="text-xs text-muted-foreground">
-                  This key grants full admin access: sales, payments, customers, products, categories, renewals, subscriptions, and reports.
-                </p>
+              <div className="flex flex-col gap-2 rounded-lg border p-3">
+                <Label className="text-sm font-medium">Permission Level</Label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPermMode("full")}
+                    className={`flex-1 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${permMode === "full" ? "border-primary bg-primary text-primary-foreground" : "border-border hover:bg-muted/50"}`}
+                  >
+                    <Shield className="mr-1.5 inline h-4 w-4" /> Full Admin
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPermMode("limited")}
+                    className={`flex-1 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${permMode === "limited" ? "border-primary bg-primary text-primary-foreground" : "border-border hover:bg-muted/50"}`}
+                  >
+                    <Lock className="mr-1.5 inline h-4 w-4" /> Limited
+                  </button>
+                </div>
+                {permMode === "full" ? (
+                  <p className="text-xs text-muted-foreground">Full admin access to all resources — recommended for Hermes.</p>
+                ) : (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permSalesRead} onChange={(e) => setPermSalesRead(e.target.checked)} /> Read sales</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permSalesWrite} onChange={(e) => setPermSalesWrite(e.target.checked)} /> Create/update sales</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permCustomersRead} onChange={(e) => setPermCustomersRead(e.target.checked)} /> Read customers</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permCustomersWrite} onChange={(e) => setPermCustomersWrite(e.target.checked)} /> Create/update customers</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permProductsRead} onChange={(e) => setPermProductsRead(e.target.checked)} /> Read products</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permPaymentsWrite} onChange={(e) => setPermPaymentsWrite(e.target.checked)} /> Add payments</label>
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permDashboard} onChange={(e) => setPermDashboard(e.target.checked)} /> Read dashboard</label>
+                  </div>
+                )}
               </div>
             </div>
             <DialogFooter>
@@ -597,6 +646,7 @@ export function IntegrationsPage() {
                       </div>
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                         <span className="font-mono">{key.key_prefix}...</span>
+                        <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${key.permissions?.includes("*") ? "bg-primary/10 text-primary" : "bg-muted"}`}>{key.permissions?.includes("*") ? "Full Admin" : key.permissions?.length > 0 ? `${key.permissions.length} scopes` : "No access"}</span>
                         <span>Created {formatDate(key.created_at)}</span>
                         {key.expires_at && <span>Expires {formatDate(key.expires_at)}</span>}
                         {key.last_used_at && <span>Last used {formatDate(key.last_used_at)}</span>}

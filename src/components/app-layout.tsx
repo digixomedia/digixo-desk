@@ -71,11 +71,16 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Sell",
+    label: "Sales",
     items: [
       { label: "New Sale", to: "/sales/new", icon: <PlusCircle className="h-4 w-4" /> },
       { label: "Sales", to: "/sales", icon: <ShoppingCart className="h-4 w-4" /> },
       { label: "Renewals", to: "/renewals", icon: <RefreshCw className="h-4 w-4" /> },
+    ],
+  },
+  {
+    label: "Customers",
+    items: [
       { label: "Customers", to: "/customers", icon: <Users className="h-4 w-4" /> },
     ],
   },
@@ -87,18 +92,23 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Insights",
+    label: "Finance",
     items: [
       { label: "Financial Reports", to: "/finance/reports", icon: <BarChart3 className="h-4 w-4" /> },
       { label: "Refunds", to: "/finance/refunds", icon: <RotateCcw className="h-4 w-4" /> },
+      { label: "Export Data", to: "/finance/export", icon: <Download className="h-4 w-4" /> },
+    ],
+  },
+  {
+    label: "Team",
+    items: [
+      { label: "Integrations", to: "/integrations", icon: <KeyRound className="h-4 w-4" />, ownerOnly: true },
     ],
   },
   {
     label: "System",
     items: [
-      { label: "Export Data", to: "/finance/export", icon: <Download className="h-4 w-4" /> },
       { label: "Demo Data", to: "/demo", icon: <FlaskConical className="h-4 w-4" /> },
-      { label: "Integrations", to: "/integrations", icon: <KeyRound className="h-4 w-4" />, ownerOnly: true },
       { label: "Settings", to: "/settings", icon: <Settings className="h-4 w-4" /> },
     ],
   },

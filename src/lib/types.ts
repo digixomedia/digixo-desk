@@ -278,6 +278,7 @@ export interface ApiKey {
   created_by: string;
   request_count: number;
   last_request: string | null;
+  permissions: string[];
 }
 
 export interface ApiKeyStats {

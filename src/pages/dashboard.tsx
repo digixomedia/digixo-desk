@@ -68,12 +68,6 @@ interface WeeklySales {
   sale_count: number;
 }
 
-interface PrevMonthStats {
-  revenue: number;
-  profit: number;
-  sale_count: number;
-}
-
 const CHART_COLORS = [
   "#6366f1",
   "#22c55e",
@@ -499,6 +493,28 @@ export function DashboardPage() {
   const navigate = useNavigate();
   const [chartMonths, setChartMonths] = useState("6");
 
+  const { data: finStats, isLoading: finLoading } = useQuery({
+    queryKey: ["dashboard-financial-stats"],
+    queryFn: async () => {
+      const { data, error } = await supabase.rpc("dashboard_financial_stats");
+      if (error) throw error;
+      return data as {
+        revenue_this_month: number;
+        cash_received_this_month: number;
+        expenses_this_month: number;
+        gross_profit_this_month: number;
+        net_profit_this_month: number;
+        pending_payments_count: number;
+        activations_pending_count: number;
+        upcoming_renewals_count: number;
+        overdue_renewals_count: number;
+        renewals_due_today_count: number;
+        prev_month_revenue: number;
+        prev_month_profit: number;
+      };
+    },
+  });
+
   const { data: ownerStats, isLoading: ownerLoading } = useQuery({
     queryKey: ["owner-dashboard"],
     queryFn: async () => {
@@ -517,15 +533,6 @@ export function DashboardPage() {
       return data as ManagerDashboardStats;
     },
     enabled: !isOwner,
-  });
-
-  const { data: prevMonth } = useQuery({
-    queryKey: ["dashboard-prev-month"],
-    queryFn: async () => {
-      const { data, error } = await supabase.rpc("dashboard_prev_month_stats");
-      if (error) throw error;
-      return data as PrevMonthStats;
-    },
   });
 
   const { data: recentSales } = useQuery({
@@ -572,36 +579,43 @@ export function DashboardPage() {
         {isOwner ? (
           <>
             {/* Key stats with trends */}
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <StatCard
-                label="Revenue (Month)"
-                value={formatMoney(ownerStats?.revenue_this_month ?? 0)}
+                label="Revenue"
+                value={formatMoney(finStats?.revenue_this_month ?? 0)}
                 icon={<IndianRupee className="h-5 w-5" />}
                 tone="primary"
-                loading={ownerLoading}
-                trend={<TrendIndicator current={ownerStats?.revenue_this_month ?? 0} previous={prevMonth?.revenue ?? 0} />}
+                loading={finLoading}
+                trend={<TrendIndicator current={finStats?.revenue_this_month ?? 0} previous={finStats?.prev_month_revenue ?? 0} />}
               />
               <StatCard
                 label="Cash Received"
-                value={formatMoney(ownerStats?.cash_received_this_month ?? 0)}
+                value={formatMoney(finStats?.cash_received_this_month ?? 0)}
                 icon={<CheckCircle2 className="h-5 w-5" />}
                 tone="success"
-                loading={ownerLoading}
+                loading={finLoading}
               />
               <StatCard
-                label="Product Cost"
-                value={formatMoney(ownerStats?.product_cost_this_month ?? 0)}
+                label="Expenses"
+                value={formatMoney(finStats?.expenses_this_month ?? 0)}
                 icon={<Package className="h-5 w-5" />}
                 tone="info"
-                loading={ownerLoading}
+                loading={finLoading}
               />
               <StatCard
                 label="Gross Profit"
-                value={formatMoney(ownerStats?.gross_profit_this_month ?? 0)}
+                value={formatMoney(finStats?.gross_profit_this_month ?? 0)}
                 icon={<TrendingUp className="h-5 w-5" />}
                 tone="success"
-                loading={ownerLoading}
-                trend={<TrendIndicator current={ownerStats?.gross_profit_this_month ?? 0} previous={prevMonth?.profit ?? 0} />}
+                loading={finLoading}
+                trend={<TrendIndicator current={finStats?.gross_profit_this_month ?? 0} previous={finStats?.prev_month_profit ?? 0} />}
+              />
+              <StatCard
+                label="Net Profit"
+                value={formatMoney(finStats?.net_profit_this_month ?? 0)}
+                icon={<TrendingUp className="h-5 w-5" />}
+                tone={finStats && finStats.net_profit_this_month >= 0 ? "success" : "danger"}
+                loading={finLoading}
               />
               <StatCard
                 label="Active Customers"
@@ -609,6 +623,14 @@ export function DashboardPage() {
                 icon={<Users className="h-5 w-5" />}
                 loading={ownerLoading}
               />
+            </div>
+
+            {/* Operational stats row */}
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <StatCard label="Pending Payments" value={String(finStats?.pending_payments_count ?? 0)} icon={<Clock className="h-5 w-5" />} tone="warning" loading={finLoading} />
+              <StatCard label="Activations Pending" value={String(finStats?.activations_pending_count ?? 0)} icon={<Clock className="h-5 w-5" />} tone="warning" loading={finLoading} />
+              <StatCard label="Renewals Due Today" value={String(finStats?.renewals_due_today_count ?? 0)} icon={<CalendarClock className="h-5 w-5" />} tone="warning" loading={finLoading} />
+              <StatCard label="Overdue Renewals" value={String(finStats?.overdue_renewals_count ?? 0)} icon={<AlertTriangle className="h-5 w-5" />} tone="danger" loading={finLoading} />
             </div>
 
             {/* Revenue chart with range selector */}

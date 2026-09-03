@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams, useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth";
 import { PageContainer, PageHeader, EmptyState, StatusBadge } from "@/components/ui-shared";
@@ -37,6 +37,9 @@ import {
   ChevronRight,
   IndianRupee,
   Clock,
+  CheckCircle2,
+  RotateCcw,
+  ExternalLink,
 } from "lucide-react";
 import { formatMoney, formatDate, formatDateTime, normalizePhone } from "@/lib/format";
 import type { Sale, Payment } from "@/lib/types";
@@ -49,6 +52,7 @@ type SortDir = "asc" | "desc";
 export function SalesPage() {
   const { profile, isOwner } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [payStatus, setPayStatus] = useState<string>(searchParams.get("pay") || "all");
@@ -121,29 +125,24 @@ export function SalesPage() {
     },
   });
 
-  // Fetch all matching sales' total value (separate query for summary)
+  // Accurate financial summary from server
   const { data: summary } = useQuery({
-    queryKey: ["sales-summary", search, payStatus, fulfilStatus],
+    queryKey: ["sales-financial-summary", search, payStatus, fulfilStatus],
     queryFn: async () => {
-      let q = supabase
-        .from("sales")
-        .select("final_selling_price, payment_status");
-
-      if (payStatus !== "all") q = q.eq("payment_status", payStatus);
-      if (fulfilStatus !== "all") q = q.eq("fulfilment_status", fulfilStatus);
-      if (search.trim()) {
-        const lower = search.toLowerCase();
-        q = q.or(`sale_number.ilike.%${lower}%,product_name_snapshot.ilike.%${lower}%`);
-      }
-
-      const { data, error } = await q;
+      const { data, error } = await supabase.rpc("sales_financial_summary", {
+        p_search: search.trim() || null,
+        p_payment_status: payStatus === "all" ? null : payStatus,
+        p_fulfilment_status: fulfilStatus === "all" ? null : fulfilStatus,
+      });
       if (error) throw error;
-      const rows = data as Pick<Sale, "final_selling_price" | "payment_status">[];
-      const totalValue = rows.reduce((s, r) => s + r.final_selling_price, 0);
-      const outstanding = rows
-        .filter((r) => r.payment_status === "pending" || r.payment_status === "partial")
-        .reduce((s, r) => s + r.final_selling_price, 0);
-      return { totalValue, outstanding, count: rows.length };
+      return data as {
+        total_order_value: number;
+        cash_collected: number;
+        outstanding: number;
+        refund_total: number;
+        net_collected: number;
+        sale_count: number;
+      };
     },
   });
 
@@ -163,14 +162,24 @@ export function SalesPage() {
     enabled: !!selectedSaleId,
   });
 
-  const { data: outstanding } = useQuery({
-    queryKey: ["sale-outstanding", selectedSaleId],
+  const { data: financialDetail } = useQuery({
+    queryKey: ["sale-financial-detail", selectedSaleId],
     queryFn: async () => {
-      const { data, error } = await supabase.rpc("sale_outstanding", {
+      const { data, error } = await supabase.rpc("sale_financial_detail", {
         p_sale_id: selectedSaleId!,
       });
       if (error) throw error;
-      return data as number;
+      return data as {
+        total_price: number;
+        total_paid: number;
+        refund_amount: number;
+        outstanding: number;
+        net_collected: number;
+        cost_price: number;
+        payment_fee: number;
+        gross_profit: number;
+        margin_pct: number;
+      };
     },
     enabled: !!selectedSaleId,
   });
@@ -198,9 +207,11 @@ export function SalesPage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sale-payments", selectedSaleId] });
-      queryClient.invalidateQueries({ queryKey: ["sale-outstanding", selectedSaleId] });
+      queryClient.invalidateQueries({ queryKey: ["sale-financial-detail", selectedSaleId] });
       queryClient.invalidateQueries({ queryKey: ["sales"] });
+      queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
       queryClient.invalidateQueries({ queryKey: ["customer-payments"] });
+      queryClient.invalidateQueries({ queryKey: ["customer-financial-summary"] });
       setAddPayAmount("");
       setAddPayMethod("");
       setAddPayRef("");
@@ -218,9 +229,11 @@ export function SalesPage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sale-payments", selectedSaleId] });
-      queryClient.invalidateQueries({ queryKey: ["sale-outstanding", selectedSaleId] });
+      queryClient.invalidateQueries({ queryKey: ["sale-financial-detail", selectedSaleId] });
       queryClient.invalidateQueries({ queryKey: ["sales"] });
+      queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
       queryClient.invalidateQueries({ queryKey: ["customer-payments"] });
+      queryClient.invalidateQueries({ queryKey: ["customer-financial-summary"] });
       toast.success("Payment reversed");
     },
     onError: (err: Error) => toast.error(err.message),
@@ -246,8 +259,8 @@ export function SalesPage() {
     setSearchParams({});
   };
 
-  const totalPaid =
-    payments?.filter((p) => p.status === "valid").reduce((sum, p) => sum + p.amount, 0) ?? 0;
+  const totalPaid = financialDetail?.total_paid ??
+    (payments?.filter((p) => p.status === "valid").reduce((sum, p) => sum + p.amount, 0) ?? 0);
 
   const toggleSort = (field: SortField) => {
     if (sortField === field) {
@@ -290,19 +303,31 @@ export function SalesPage() {
         <div className="flex flex-wrap items-center gap-4 rounded-lg border bg-muted/30 px-4 py-3">
           <div className="flex items-center gap-2">
             <ShoppingCart className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm text-muted-foreground">Total Sales:</span>
-            <span className="text-sm font-semibold">{summary?.count ?? 0}</span>
+            <span className="text-sm text-muted-foreground">Sales:</span>
+            <span className="text-sm font-semibold">{summary?.sale_count ?? 0}</span>
           </div>
           <div className="flex items-center gap-2">
             <IndianRupee className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm text-muted-foreground">Total Value:</span>
-            <span className="text-sm font-semibold">{formatMoney(summary?.totalValue ?? 0)}</span>
+            <span className="text-sm text-muted-foreground">Order Value:</span>
+            <span className="text-sm font-semibold">{formatMoney(summary?.total_order_value ?? 0)}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4 text-muted-foreground" />
+            <span className="text-sm text-muted-foreground">Collected:</span>
+            <span className="text-sm font-semibold text-success">{formatMoney(summary?.cash_collected ?? 0)}</span>
           </div>
           <div className="flex items-center gap-2">
             <Clock className="h-4 w-4 text-muted-foreground" />
             <span className="text-sm text-muted-foreground">Outstanding:</span>
             <span className="text-sm font-semibold text-warning">{formatMoney(summary?.outstanding ?? 0)}</span>
           </div>
+          {summary && summary.refund_total > 0 && (
+            <div className="flex items-center gap-2">
+              <RotateCcw className="h-4 w-4 text-muted-foreground" />
+              <span className="text-sm text-muted-foreground">Refunded:</span>
+              <span className="text-sm font-semibold text-destructive">{formatMoney(summary.refund_total)}</span>
+            </div>
+          )}
         </div>
 
         {/* Quick filter buttons */}
@@ -512,9 +537,20 @@ export function SalesPage() {
               <SheetHeader>
                 <div className="flex items-center justify-between">
                   <SheetTitle>Sale {selectedSale.sale_number}</SheetTitle>
-                  <Button variant="ghost" size="icon" onClick={closePanel}>
-                    <X className="h-4 w-4" />
-                  </Button>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1.5"
+                      onClick={() => navigate(`/sales/${selectedSale.id}`)}
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      <span className="hidden sm:inline">Full Details</span>
+                    </Button>
+                    <Button variant="ghost" size="icon" onClick={closePanel}>
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
                 </div>
                 <SheetDescription>{formatDateTime(selectedSale.created_at)}</SheetDescription>
               </SheetHeader>
@@ -534,33 +570,49 @@ export function SalesPage() {
                   <p className="text-sm text-muted-foreground">{selectedSale.plan_name_snapshot} · {selectedSale.purchase_type_snapshot === "recurring" ? "Recurring" : "One-time"}</p>
                 </div>
 
-                {/* Prices */}
-                <div className="grid grid-cols-2 gap-2 rounded-lg border p-3 text-sm">
-                  <div><p className="text-xs text-muted-foreground">Selling Price</p><p className="font-medium">{formatMoney(selectedSale.final_selling_price)}</p></div>
-                  <div><p className="text-xs text-muted-foreground">Product Cost</p><p>{formatMoney(selectedSale.cost_price_snapshot)}</p></div>
-                  <div><p className="text-xs text-muted-foreground">Payment Fee</p><p>{formatMoney(selectedSale.payment_fee)}</p></div>
-                  <div><p className="text-xs text-muted-foreground">List Price</p><p>{formatMoney(selectedSale.list_price_snapshot)}</p></div>
-                  {selectedSale.refund_amount > 0 && <div><p className="text-xs text-muted-foreground">Refund</p><p>{formatMoney(selectedSale.refund_amount)}</p></div>}
-                  {selectedSale.replacement_cost > 0 && <div><p className="text-xs text-muted-foreground">Replacement</p><p>{formatMoney(selectedSale.replacement_cost)}</p></div>}
-                </div>
-
                 {/* Payment summary */}
                 <div className="rounded-lg border p-3">
                   <div className="flex items-center justify-between">
                     <p className="text-xs font-medium text-muted-foreground">Payment Summary</p>
                     <StatusBadge status={selectedSale.payment_status} />
                   </div>
-                  <div className="mt-2 flex justify-between text-sm">
-                    <span>Total: <span className="font-medium">{formatMoney(selectedSale.final_selling_price)}</span></span>
-                    <span>Paid: <span className="font-medium text-success">{formatMoney(totalPaid)}</span></span>
-                  </div>
-                  {outstanding !== undefined && outstanding > 0 && (
-                    <div className="mt-1 flex justify-between text-sm">
-                      <span className="text-warning">Outstanding:</span>
-                      <span className="font-medium text-warning">{formatMoney(outstanding)}</span>
+                  <div className="mt-2 flex flex-col gap-1 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Total Price</span>
+                      <span className="font-medium">{formatMoney(financialDetail?.total_price ?? selectedSale.final_selling_price)}</span>
                     </div>
-                  )}
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Paid</span>
+                      <span className="font-medium text-success">{formatMoney(financialDetail?.total_paid ?? totalPaid)}</span>
+                    </div>
+                    {(financialDetail?.refund_amount ?? selectedSale.refund_amount) > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Refunded</span>
+                        <span className="font-medium text-destructive">{formatMoney(financialDetail?.refund_amount ?? selectedSale.refund_amount)}</span>
+                      </div>
+                    )}
+                    {(financialDetail?.outstanding ?? 0) > 0 && (
+                      <div className="flex justify-between border-t pt-1">
+                        <span className="text-warning font-medium">Outstanding</span>
+                        <span className="font-semibold text-warning">{formatMoney(financialDetail?.outstanding ?? 0)}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Net Collected</span>
+                      <span className="font-medium">{formatMoney(financialDetail?.net_collected ?? 0)}</span>
+                    </div>
+                  </div>
                 </div>
+
+                {/* Profit breakdown */}
+                {isOwner && financialDetail && (
+                  <div className="grid grid-cols-2 gap-2 rounded-lg border p-3 text-sm">
+                    <div><p className="text-xs text-muted-foreground">Cost</p><p>{formatMoney(financialDetail.cost_price)}</p></div>
+                    <div><p className="text-xs text-muted-foreground">Payment Fee</p><p>{formatMoney(financialDetail.payment_fee)}</p></div>
+                    <div><p className="text-xs text-muted-foreground">Gross Profit</p><p className="font-medium text-success">{formatMoney(financialDetail.gross_profit)}</p></div>
+                    <div><p className="text-xs text-muted-foreground">Margin</p><p className="font-medium">{financialDetail.margin_pct}%</p></div>
+                  </div>
+                )}
 
                 {/* Payments list */}
                 {payments && payments.length > 0 && (

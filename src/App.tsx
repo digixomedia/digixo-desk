@@ -12,6 +12,7 @@ import { CustomersPage } from "@/pages/customers";
 import { CustomerProfilePage } from "@/pages/customer-profile";
 import { NewSalePage } from "@/pages/new-sale";
 import { SalesPage } from "@/pages/sales";
+import { SaleDetailsPage } from "@/pages/sale-details";
 import { RenewalsPage } from "@/pages/renewals";
 import { FinancialReportsPage } from "@/pages/financial-reports";
 import { ExportDataPage } from "@/pages/export-data";
@@ -42,6 +43,7 @@ export function App() {
                       <Route path="/customers/:id" element={<CustomerProfilePage />} />
                       <Route path="/sales" element={<SalesPage />} />
                       <Route path="/sales/new" element={<NewSalePage />} />
+                      <Route path="/sales/:id" element={<SaleDetailsPage />} />
                       <Route path="/renewals" element={<RenewalsPage />} />
                       <Route path="/finance/reports" element={<FinancialReportsPage />} />
                       <Route path="/finance/export" element={<ExportDataPage />} />

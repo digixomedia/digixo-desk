@@ -95,6 +95,25 @@ export function CustomerProfilePage() {
     enabled: !!id,
   });
 
+  const { data: financial } = useQuery({
+    queryKey: ["customer-financial-summary", id],
+    queryFn: async () => {
+      const { data, error } = await supabase.rpc("customer_financial_summary", {
+        p_customer_id: id!,
+      });
+      if (error) throw error;
+      return data as {
+        total_order_value: number;
+        cash_collected: number;
+        outstanding: number;
+        refund_total: number;
+        net_collected: number;
+        sale_count: number;
+      };
+    },
+    enabled: !!id,
+  });
+
   if (isLoading) {
     return (
       <PageContainer>
@@ -115,23 +134,11 @@ export function CustomerProfilePage() {
     );
   }
 
-  // Financial metrics
-  const validSales = sales?.filter((s) => s.payment_status !== "cancelled" && s.payment_status !== "refunded") ?? [];
-  const totalOrderValue = validSales.reduce((sum, s) => sum + s.final_selling_price, 0);
-  const validPayments = payments?.filter((p) => p.status === "valid") ?? [];
-  const amountPaid = validPayments.reduce((sum, p) => sum + p.amount, 0);
-  const refunded = sales?.reduce((sum, s) => sum + s.refund_amount, 0) ?? 0;
-  const netCollected = amountPaid - refunded;
-
-  const outstanding = (sales ?? [])
-    .filter((s) => s.payment_status === "pending" || s.payment_status === "partial")
-    .reduce((sum, s) => {
-      const paidForSale = validPayments
-        .filter((p) => p.sale_id === s.id)
-        .reduce((sum, p) => sum + p.amount, 0);
-      const balance = s.final_selling_price - paidForSale - s.refund_amount;
-      return sum + Math.max(0, balance);
-    }, 0);
+  // Financial metrics from server RPC
+  const totalOrderValue = financial?.total_order_value ?? 0;
+  const amountPaid = financial?.cash_collected ?? 0;
+  const outstanding = financial?.outstanding ?? 0;
+  const netCollected = financial?.net_collected ?? 0;
 
   const lastPurchase = sales?.[0];
 

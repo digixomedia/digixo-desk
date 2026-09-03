@@ -49,7 +49,7 @@ type RenewalWithRelations = Renewal & {
   }) | null;
 };
 
-type FilterTab = "all" | "overdue" | "today" | "upcoming";
+type FilterTab = "all" | "overdue" | "today" | "next7" | "next30" | "future";
 
 function daysOverdue(dueDate: string): number {
   const due = new Date(dueDate + "T00:00:00Z");
@@ -126,16 +126,18 @@ export function RenewalsPage() {
     all: allRenewals.length,
     overdue: allRenewals.filter((r) => daysOverdue(r.due_date) > 0).length,
     today: allRenewals.filter((r) => daysOverdue(r.due_date) === 0).length,
-    upcoming: allRenewals.filter(
-      (r) => daysOverdue(r.due_date) < 0 && daysOverdue(r.due_date) >= -30,
-    ).length,
+    next7: allRenewals.filter((r) => { const d = daysOverdue(r.due_date); return d < 0 && d >= -7; }).length,
+    next30: allRenewals.filter((r) => { const d = daysOverdue(r.due_date); return d < 0 && d >= -30; }).length,
+    future: allRenewals.filter((r) => daysOverdue(r.due_date) < -30).length,
   };
 
   const filteredRenewals = allRenewals.filter((r) => {
     const days = daysOverdue(r.due_date);
     if (filter === "overdue") return days > 0;
     if (filter === "today") return days === 0;
-    if (filter === "upcoming") return days < 0 && days >= -30;
+    if (filter === "next7") return days < 0 && days >= -7;
+    if (filter === "next30") return days < 0 && days >= -30;
+    if (filter === "future") return days < -30;
     return true;
   });
 
@@ -241,7 +243,9 @@ export function RenewalsPage() {
     { key: "all", label: "All", count: counts.all },
     { key: "overdue", label: "Overdue", count: counts.overdue },
     { key: "today", label: "Due Today", count: counts.today },
-    { key: "upcoming", label: "Upcoming", count: counts.upcoming },
+    { key: "next7", label: "Next 7 Days", count: counts.next7 },
+    { key: "next30", label: "Next 30 Days", count: counts.next30 },
+    { key: "future", label: "Future", count: counts.future },
   ];
 
   return (
@@ -264,7 +268,7 @@ export function RenewalsPage() {
         </div>
 
         {/* Summary cards */}
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           {[
             {
               label: "Total Pending",
@@ -285,9 +289,21 @@ export function RenewalsPage() {
               icon: <Clock className="h-5 w-5" />,
             },
             {
-              label: "Upcoming (30 days)",
-              value: counts.upcoming,
+              label: "Next 7 Days",
+              value: counts.next7,
               tone: "text-info bg-info/10",
+              icon: <CalendarClock className="h-5 w-5" />,
+            },
+            {
+              label: "Next 30 Days",
+              value: counts.next30,
+              tone: "text-info bg-info/10",
+              icon: <CalendarClock className="h-5 w-5" />,
+            },
+            {
+              label: "Future",
+              value: counts.future,
+              tone: "text-muted-foreground bg-muted/50",
               icon: <CalendarClock className="h-5 w-5" />,
             },
           ].map((card) => (
