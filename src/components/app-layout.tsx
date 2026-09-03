@@ -8,7 +8,6 @@ import {
   Package,
   FlaskConical,
   LogOut,
-  Bell,
   Search,
   Menu,
   Moon,
@@ -18,6 +17,8 @@ import {
   Download,
   RotateCcw,
   KeyRound,
+  Settings,
+  ChevronRight,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { useTheme } from "@/components/theme-provider";
@@ -37,11 +38,18 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { cn } from "@/lib/utils";
 import { initials } from "@/lib/format";
 import { useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
+import { CommandPalette } from "@/components/command-palette";
+import { NotificationBell } from "@/components/notification-bell";
 
 interface NavItem {
   label: string;
@@ -57,13 +65,13 @@ interface NavGroup {
 
 const NAV_GROUPS: NavGroup[] = [
   {
-    label: "Overview",
+    label: "Home",
     items: [
       { label: "Dashboard", to: "/", icon: <LayoutDashboard className="h-4 w-4" /> },
     ],
   },
   {
-    label: "Operations",
+    label: "Sell",
     items: [
       { label: "New Sale", to: "/sales/new", icon: <PlusCircle className="h-4 w-4" /> },
       { label: "Sales", to: "/sales", icon: <ShoppingCart className="h-4 w-4" /> },
@@ -79,18 +87,19 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Finance",
+    label: "Insights",
     items: [
       { label: "Financial Reports", to: "/finance/reports", icon: <BarChart3 className="h-4 w-4" /> },
       { label: "Refunds", to: "/finance/refunds", icon: <RotateCcw className="h-4 w-4" /> },
-      { label: "Export Data", to: "/finance/export", icon: <Download className="h-4 w-4" /> },
     ],
   },
   {
-    label: "Tools",
+    label: "System",
     items: [
+      { label: "Export Data", to: "/finance/export", icon: <Download className="h-4 w-4" /> },
       { label: "Demo Data", to: "/demo", icon: <FlaskConical className="h-4 w-4" /> },
       { label: "Integrations", to: "/integrations", icon: <KeyRound className="h-4 w-4" />, ownerOnly: true },
+      { label: "Settings", to: "/settings", icon: <Settings className="h-4 w-4" /> },
     ],
   },
 ];
@@ -98,40 +107,72 @@ const NAV_GROUPS: NavGroup[] = [
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   const location = useLocation();
   const { isOwner } = useAuth();
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+
+  const toggleGroup = (label: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
+  };
 
   return (
-    <nav className="flex flex-col gap-4 px-3 py-4">
-      {NAV_GROUPS.map((group) => (
-        <div key={group.label} className="flex flex-col gap-1">
-          <p className="px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            {group.label}
-          </p>
-          {group.items
-            .filter((item) => !item.ownerOnly || isOwner)
-            .map((item) => {
-              const active =
-                item.to === "/"
-                  ? location.pathname === "/"
-                  : location.pathname.startsWith(item.to);
-              return (
-                <Link
-                  key={item.to}
-                  to={item.to}
-                  onClick={onNavigate}
+    <nav className="flex flex-col gap-2 px-3 py-4">
+      {NAV_GROUPS.map((group) => {
+        const visibleItems = group.items.filter(
+          (item) => !item.ownerOnly || isOwner
+        );
+        if (visibleItems.length === 0) return null;
+        const isCollapsed = collapsedGroups.has(group.label);
+
+        return (
+          <Collapsible
+            key={group.label}
+            open={!isCollapsed}
+            onOpenChange={() => toggleGroup(group.label)}
+          >
+            <CollapsibleTrigger asChild>
+              <button className="flex w-full items-center gap-1 px-3 py-1 text-xs font-medium uppercase tracking-wider text-muted-foreground hover:text-foreground">
+                <ChevronRight
                   className={cn(
-                    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                    active
-                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                      : "text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                    "h-3 w-3 transition-transform",
+                    !isCollapsed && "rotate-90"
                   )}
-                >
-                  {item.icon}
-                  {item.label}
-                </Link>
-              );
-            })}
-        </div>
-      ))}
+                />
+                {group.label}
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="flex flex-col gap-0.5">
+                {visibleItems.map((item) => {
+                  const active =
+                    item.to === "/"
+                      ? location.pathname === "/"
+                      : location.pathname.startsWith(item.to);
+                  return (
+                    <Link
+                      key={item.to}
+                      to={item.to}
+                      onClick={onNavigate}
+                      className={cn(
+                        "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                        active
+                          ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                          : "text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                      )}
+                    >
+                      {item.icon}
+                      {item.label}
+                    </Link>
+                  );
+                })}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        );
+      })}
     </nav>
   );
 }
@@ -166,6 +207,11 @@ function UserMenu() {
             {profile?.role}
           </span>
         </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => navigate("/settings")}>
+          <Settings className="mr-2 h-4 w-4" />
+          Settings
+        </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
           onClick={() => {
@@ -270,6 +316,28 @@ export function AppLayout({ children }: { children: ReactNode }) {
 
           <div className="flex-1" />
 
+          {/* Command palette trigger */}
+          <Button
+            variant="outline"
+            size="sm"
+            className="hidden gap-2 lg:flex"
+            onClick={() => {
+              window.dispatchEvent(
+                new KeyboardEvent("keydown", {
+                  key: "k",
+                  metaKey: true,
+                  ctrlKey: navigator.platform.includes("Mac"),
+                })
+              );
+            }}
+          >
+            <Search className="h-3.5 w-3.5" />
+            <span>Quick Search</span>
+            <kbd className="ml-1 rounded border bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+              ⌘K
+            </kbd>
+          </Button>
+
           {/* Quick New Sale */}
           <Button
             size="sm"
@@ -280,11 +348,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
             <span className="hidden sm:inline">New Sale</span>
           </Button>
 
-          {/* Notification (prepared for future) */}
-          <Button variant="ghost" size="icon" className="relative">
-            <Bell className="h-4 w-4" />
-            <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary/60" />
-          </Button>
+          <NotificationBell />
 
           <ThemeToggle />
 
@@ -296,6 +360,8 @@ export function AppLayout({ children }: { children: ReactNode }) {
           {children}
         </main>
       </div>
+
+      <CommandPalette />
     </div>
   );
 }

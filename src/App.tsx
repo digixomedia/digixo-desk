@@ -18,6 +18,7 @@ import { ExportDataPage } from "@/pages/export-data";
 import { RefundsPage } from "@/pages/refunds";
 import { DemoDataPage } from "@/pages/demo-data";
 import { IntegrationsPage } from "@/pages/integrations";
+import { SettingsPage } from "@/pages/settings";
 import { RequireOwner } from "@/components/route-guards";
 
 export function App() {
@@ -47,6 +48,7 @@ export function App() {
                       <Route path="/finance/refunds" element={<RefundsPage />} />
                       <Route path="/demo" element={<DemoDataPage />} />
                       <Route path="/integrations" element={<RequireOwner><IntegrationsPage /></RequireOwner>} />
+                      <Route path="/settings" element={<SettingsPage />} />
                       <Route path="*" element={<Navigate to="/" replace />} />
                     </Routes>
                   </AppLayout>
