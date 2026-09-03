@@ -1,0 +1,2 @@
+[functions.digixodesk-api]
+verify_jwt = false

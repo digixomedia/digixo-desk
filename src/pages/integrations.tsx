@@ -38,10 +38,11 @@ import {
   AlertTriangle,
   ChevronLeft,
   ChevronRight,
+  Terminal,
+  Shield,
 } from "lucide-react";
 import { formatDate, formatDateTime } from "@/lib/format";
 import {
-  ALL_API_SCOPES,
   type ApiKey,
   type ApiKeyAnalytics,
   type ApiRequestLog,
@@ -60,18 +61,16 @@ function keyStatus(key: ApiKey): { label: string; status: string } {
 function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
-  const [selectedScopes, setSelectedScopes] = useState<string[]>([]);
   const [expiry, setExpiry] = useState("");
   const [newKey, setNewKey] = useState<CreateApiKeyResult | null>(null);
   const [copied, setCopied] = useState(false);
 
   const createKey = useMutation({
     mutationFn: async () => {
-      if (!name.trim()) throw new Error("Integration name is required");
+      if (!name.trim()) throw new Error("Key name is required");
       const expiresAt = expiry ? new Date(expiry + "T23:59:59").toISOString() : null;
       const { data, error } = await supabase.rpc("create_api_key", {
-        p_integration_name: name.trim(),
-        p_scopes: selectedScopes,
+        p_name: name.trim(),
         p_expires_at: expiresAt,
       });
       if (error) throw error;
@@ -79,22 +78,15 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
     },
     onSuccess: (data) => {
       setNewKey(data);
-      queryClient.invalidateQueries({ queryKey: ["api-analytics"] });
+      queryClient.invalidateQueries({ queryKey: ["api-keys"] });
       toast.success("API key created");
     },
     onError: (err: Error) => toast.error(err.message),
   });
 
-  const toggleScope = (scope: string) => {
-    setSelectedScopes((prev) =>
-      prev.includes(scope) ? prev.filter((s) => s !== scope) : [...prev, scope]
-    );
-  };
-
   const handleClose = () => {
     setNewKey(null);
     setName("");
-    setSelectedScopes([]);
     setExpiry("");
     setCopied(false);
     onOpenChange(false);
@@ -143,38 +135,18 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
             <DialogHeader>
               <DialogTitle>Generate New API Key</DialogTitle>
               <DialogDescription>
-                Create a key for an external integration. The key will be shown only once.
+                Create a key for an AI agent or integration. Every key has full admin access to all DigiXO Desk resources.
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-4">
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="int-name">Integration Name</Label>
+                <Label htmlFor="key-name">Key Name</Label>
                 <Input
-                  id="int-name"
+                  id="key-name"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="e.g. Store Bot, Telegram Bot"
+                  placeholder="e.g. Hermes Agent, Telegram Bot"
                 />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label>Scopes</Label>
-                <p className="text-xs text-muted-foreground">Select the permissions this key grants.</p>
-                <div className="grid grid-cols-2 gap-2">
-                  {ALL_API_SCOPES.map((scope) => (
-                    <label
-                      key={scope}
-                      className="flex items-center gap-2 rounded-md border p-2 text-sm cursor-pointer hover:bg-muted/50"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedScopes.includes(scope)}
-                        onChange={() => toggleScope(scope)}
-                        className="h-4 w-4"
-                      />
-                      <span className="font-mono text-xs">{scope}</span>
-                    </label>
-                  ))}
-                </div>
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="expiry">Expiry Date (optional)</Label>
@@ -185,6 +157,12 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
                   onChange={(e) => setExpiry(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">Leave blank for no expiry.</p>
+              </div>
+              <div className="flex items-start gap-2 rounded-lg border bg-muted/30 p-3">
+                <Shield className="h-4 w-4 shrink-0 text-primary" />
+                <p className="text-xs text-muted-foreground">
+                  This key grants full admin access: sales, payments, customers, products, categories, renewals, subscriptions, and reports.
+                </p>
               </div>
             </div>
             <DialogFooter>
@@ -223,7 +201,7 @@ function RotateKeyDialog({
     },
     onSuccess: (data) => {
       setNewKey(data);
-      queryClient.invalidateQueries({ queryKey: ["api-analytics"] });
+      queryClient.invalidateQueries({ queryKey: ["api-keys"] });
       toast.success("Key rotated");
     },
     onError: (err: Error) => toast.error(err.message),
@@ -278,7 +256,7 @@ function RotateKeyDialog({
             <DialogHeader>
               <DialogTitle>Rotate API Key</DialogTitle>
               <DialogDescription>
-                This will revoke the current key for "{keyName}" and generate a new one with the same scopes. The old key will stop working immediately.
+                This will revoke the current key for "{keyName}" and generate a new one. The old key will stop working immediately.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -316,7 +294,7 @@ function RevokeKeyDialog({
       if (error) throw error;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["api-analytics"] });
+      queryClient.invalidateQueries({ queryKey: ["api-keys"] });
       onOpenChange(false);
       toast.success("Key revoked");
     },
@@ -391,9 +369,8 @@ function RequestLogsSection() {
                   <tr className="border-b text-left text-xs text-muted-foreground">
                     <th className="py-2 pr-3 font-medium">Time</th>
                     <th className="py-2 pr-3 font-medium">Endpoint</th>
-                    <th className="py-2 pr-3 font-medium">Integration</th>
+                    <th className="py-2 pr-3 font-medium">Key</th>
                     <th className="py-2 pr-3 font-medium">Status</th>
-                    <th className="py-2 pr-3 font-medium">Result</th>
                     <th className="py-2 font-medium">Duration</th>
                   </tr>
                 </thead>
@@ -402,20 +379,10 @@ function RequestLogsSection() {
                     <tr key={log.id} className="border-b last:border-0">
                       <td className="py-2 pr-3 text-muted-foreground">{formatDateTime(log.created_at)}</td>
                       <td className="py-2 pr-3 font-mono text-xs">{log.method} {log.endpoint}</td>
-                      <td className="py-2 pr-3">{log.integration_name ?? "—"}</td>
+                      <td className="py-2 pr-3">{log.key_name ?? "—"}</td>
                       <td className="py-2 pr-3">
                         <span className={log.status_code < 400 ? "text-success" : log.status_code < 500 ? "text-warning" : "text-destructive"}>
                           {log.status_code}
-                        </span>
-                      </td>
-                      <td className="py-2 pr-3">
-                        <span className={
-                          log.result === "success" ? "text-success" :
-                          log.result === "auth_error" ? "text-destructive" :
-                          log.result === "rate_limited" ? "text-warning" :
-                          "text-destructive"
-                        }>
-                          {log.result.replace(/_/g, " ")}
                         </span>
                       </td>
                       <td className="py-2 text-muted-foreground">
@@ -458,6 +425,49 @@ function RequestLogsSection() {
   );
 }
 
+function ApiUsageSection() {
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const examples = [
+    { label: "List all sales", cmd: `curl -H "Authorization: Bearer YOUR_API_KEY" \\\n  https://YOUR_PROJECT.supabase.co/functions/v1/digixodesk-api/v1/sales` },
+    { label: "Get dashboard stats", cmd: `curl -H "Authorization: Bearer YOUR_API_KEY" \\\n  https://YOUR_PROJECT.supabase.co/functions/v1/digixodesk-api/v1/dashboard` },
+    { label: "Create a customer", cmd: `curl -X POST -H "Authorization: Bearer YOUR_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"name":"John Doe","phone":"9876543210"}' \\\n  https://YOUR_PROJECT.supabase.co/functions/v1/digixodesk-api/v1/customers` },
+    { label: "List renewals", cmd: `curl -H "Authorization: Bearer YOUR_API_KEY" \\\n  https://YOUR_PROJECT.supabase.co/functions/v1/digixodesk-api/v1/renewals` },
+  ];
+
+  const copy = async (cmd: string, label: string) => {
+    await navigator.clipboard.writeText(cmd);
+    setCopied(label);
+    setTimeout(() => setCopied(null), 2000);
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Terminal className="h-4 w-4" /> API Usage Examples
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="pt-0 space-y-3">
+        <p className="text-sm text-muted-foreground">
+          Use these examples to get started with the API. Replace <code className="rounded bg-muted px-1 py-0.5 text-xs font-mono">YOUR_API_KEY</code> with your generated key and <code className="rounded bg-muted px-1 py-0.5 text-xs font-mono">YOUR_PROJECT</code> with your project URL.
+        </p>
+        {examples.map((ex) => (
+          <div key={ex.label} className="rounded-lg border bg-muted/30 p-3">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-medium">{ex.label}</span>
+              <Button size="sm" variant="ghost" onClick={() => copy(ex.cmd, ex.label)} className="h-6 px-2">
+                {copied === ex.label ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+              </Button>
+            </div>
+            <pre className="text-xs font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{ex.cmd}</pre>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function IntegrationsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [rotateOpen, setRotateOpen] = useState(false);
@@ -465,9 +475,9 @@ export function IntegrationsPage() {
   const [selectedKey, setSelectedKey] = useState<{ id: string; name: string } | null>(null);
 
   const { data: analytics, isLoading } = useQuery({
-    queryKey: ["api-analytics"],
+    queryKey: ["api-keys"],
     queryFn: async () => {
-      const { data, error } = await supabase.rpc("get_api_key_analytics");
+      const { data, error } = await supabase.rpc("get_api_keys");
       if (error) throw error;
       return data as ApiKeyAnalytics;
     },
@@ -477,12 +487,12 @@ export function IntegrationsPage() {
   const stats = analytics?.stats;
 
   const openRotate = (key: ApiKey) => {
-    setSelectedKey({ id: key.id, name: key.integration_name });
+    setSelectedKey({ id: key.id, name: key.name });
     setRotateOpen(true);
   };
 
   const openRevoke = (key: ApiKey) => {
-    setSelectedKey({ id: key.id, name: key.integration_name });
+    setSelectedKey({ id: key.id, name: key.name });
     setRevokeOpen(true);
   };
 
@@ -517,8 +527,8 @@ export function IntegrationsPage() {
     <PageContainer>
       <div className="flex flex-col gap-6">
         <PageHeader
-          title="Integrations"
-          description="Manage DigiXO Desk API keys for external integrations"
+          title="API Keys"
+          description="Manage API keys for AI agents like Hermes to control your DigiXO Desk panel"
           actions={
             <Button className="gap-1.5" onClick={() => setCreateOpen(true)}>
               <Plus className="h-4 w-4" />
@@ -565,7 +575,7 @@ export function IntegrationsPage() {
           <EmptyState
             icon={<KeyRound className="h-5 w-5" />}
             title="No API keys yet"
-            description="Generate a key to allow an external integration to connect to DigiXO Desk."
+            description="Generate a key to allow an AI agent like Hermes to control your DigiXO Desk panel."
             action={
               <Button className="gap-1.5" onClick={() => setCreateOpen(true)}>
                 <Plus className="h-4 w-4" /> Generate Key
@@ -582,26 +592,16 @@ export function IntegrationsPage() {
                   <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center gap-2">
-                        <span className="font-medium">{key.integration_name}</span>
+                        <span className="font-medium">{key.name}</span>
                         <StatusBadge status={status.status} label={status.label} />
                       </div>
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                         <span className="font-mono">{key.key_prefix}...</span>
                         <span>Created {formatDate(key.created_at)}</span>
-                        {key.created_by_name && <span>By {key.created_by_name}</span>}
                         {key.expires_at && <span>Expires {formatDate(key.expires_at)}</span>}
                         {key.last_used_at && <span>Last used {formatDate(key.last_used_at)}</span>}
                         {key.request_count > 0 && <span>{key.request_count} requests</span>}
                       </div>
-                      {key.scopes.length > 0 && (
-                        <div className="flex flex-wrap gap-1 pt-1">
-                          {key.scopes.map((scope) => (
-                            <span key={scope} className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs">
-                              {scope}
-                            </span>
-                          ))}
-                        </div>
-                      )}
                     </div>
                     {isActive && (
                       <div className="flex gap-2">
@@ -619,6 +619,9 @@ export function IntegrationsPage() {
             })}
           </div>
         )}
+
+        {/* API usage examples */}
+        <ApiUsageSection />
 
         {/* Request logs */}
         <RequestLogsSection />

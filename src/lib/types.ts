@@ -265,38 +265,10 @@ export interface CreateSaleResult {
 
 // ===== API Key Management Types =====
 
-export type ApiScope =
-  | "catalog:read"
-  | "customers:read"
-  | "customers:create"
-  | "customers:update"
-  | "sales:read"
-  | "sales:create"
-  | "payments:create"
-  | "fulfilment:update"
-  | "renewals:read"
-  | "renewals:update"
-  | "reports:read";
-
-export const ALL_API_SCOPES: ApiScope[] = [
-  "catalog:read",
-  "customers:read",
-  "customers:create",
-  "customers:update",
-  "sales:read",
-  "sales:create",
-  "payments:create",
-  "fulfilment:update",
-  "renewals:read",
-  "renewals:update",
-  "reports:read",
-];
-
 export interface ApiKey {
   id: string;
-  integration_name: string;
+  name: string;
   key_prefix: string;
-  scopes: string[];
   is_active: boolean;
   created_at: string;
   expires_at: string | null;
@@ -304,16 +276,13 @@ export interface ApiKey {
   revoked_at: string | null;
   rotated_from: string | null;
   created_by: string;
-  created_by_name: string | null;
   request_count: number;
   last_request: string | null;
-  error_count: number;
 }
 
 export interface ApiKeyStats {
   total_keys: number;
   active_keys: number;
-  expired_keys: number;
   revoked_keys: number;
   total_requests: number;
   requests_today: number;
@@ -328,19 +297,16 @@ export interface CreateApiKeyResult {
   key_id: string;
   api_key: string;
   key_prefix: string;
-  integration_name: string;
+  name: string;
 }
 
 export interface ApiRequestLog {
   id: string;
   request_id: string;
-  api_key_id: string | null;
-  integration_name: string | null;
+  key_name: string | null;
   endpoint: string;
   method: string;
-  action: string;
   status_code: number;
-  result: string;
   ip_address: string | null;
   duration_ms: number | null;
   error_message: string | null;

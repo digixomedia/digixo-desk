@@ -1,288 +1,941 @@
-// DigiXO Desk API — Phase 2B: Core Business Operations (Read + Write)
-// Single Edge Function handling all /v1/* routes with custom API-key authentication.
-// JWT verification is disabled; authentication is done via DigiXO Desk API keys.
+// DigiXO Desk API — Full Admin API for AI Agent Control
+// Single Edge Function handling all /v1/* routes.
+// Every valid API key has full admin access to all resources.
+// JWT verification is disabled; authentication is via API keys only.
 
 import { createClient } from "npm:@supabase/supabase-js@2.112.0";
-import { extractBearerToken, validateApiKey, touchLastUsed, type ApiKeyInfo } from "./auth.ts";
-import { checkRateLimit, maybeCleanupRateLimits } from "./rate-limit.ts";
-import { createAuditContext, logAudit, redactError, type AuditContext } from "./audit.ts";
-import { errorResponse, jsonResponse } from "./response.ts";
-import { requireScope } from "./middleware.ts";
-import { handleHealth } from "./routes/health.ts";
-import { handleWhoami } from "./routes/whoami.ts";
-import { handleCatalogProducts } from "./routes/catalog.ts";
-import { handleCustomerSearch, handleCustomerDetail, handleCustomerCreate, handleCustomerUpdate } from "./routes/customers.ts";
-import { handleSaleSearch, handleSaleDetail, handleSaleCreate, handlePaymentCreate, handleFulfilmentUpdate } from "./routes/sales.ts";
-import { handleRenewalSearch, handleRenewalUpdate } from "./routes/renewals.ts";
-import { handleReportsSummary } from "./routes/reports.ts";
 
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://digixo-desk-gt8r.bolt.host";
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+};
 
-function getCorsHeaders(req: Request): Record<string, string> {
-  const origin = req.headers.get("Origin");
-  const headers: Record<string, string> = {
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
-    "Access-Control-Max-Age": "86400",
-  };
-  if (origin === ALLOWED_ORIGIN) {
-    headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN;
-  }
-  return headers;
+const RATE_LIMIT_PER_KEY = 120; // requests per minute
+
+function jsonResponse(body: unknown, status: number, extra?: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json", ...extra },
+  });
 }
 
-const RATE_LIMIT_PER_KEY = 60;
-const RATE_LIMIT_PER_IP = 120;
+function errorResponse(code: string, message: string, requestId: string, status: number): Response {
+  return jsonResponse({ success: false, error: { code, message, request_id: requestId } }, status);
+}
+
+function successResponse(data: unknown, status = 200, extra?: Record<string, string>): Response {
+  return jsonResponse({ success: true, data }, status, extra);
+}
+
+function generateRequestId(): string {
+  return crypto.randomUUID();
+}
+
+function getClientIP(req: Request): string | null {
+  const fwd = req.headers.get("x-forwarded-for");
+  if (fwd) return fwd.split(",")[0].trim();
+  const real = req.headers.get("x-real-ip");
+  return real || null;
+}
 
 function createServiceClient() {
   const url = Deno.env.get("SUPABASE_URL");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !serviceKey) {
-    throw new Error("Missing server configuration");
-  }
+  if (!url || !serviceKey) throw new Error("Missing server configuration");
   return createClient(url, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
 
+// =========================================================
+// Auth
+// =========================================================
+
+interface ApiKeyInfo {
+  key_id: string;
+  key_name: string;
+}
+
+async function authenticate(req: Request, supabase: ReturnType<typeof createClient>): Promise<ApiKeyInfo | null> {
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice(7).trim();
+  if (!token) return null;
+
+  // Hash the token with SHA-256
+  const encoder = new TextEncoder();
+  const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(token));
+  const keyHash = Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  const { data, error } = await supabase.rpc("validate_api_key", { p_key_hash: keyHash });
+  if (error || !data || data.valid !== true) return null;
+
+  // Touch last_used_at (fire and forget)
+  supabase.rpc("touch_api_key_last_used", { p_key_id: data.key_id }).then(() => {});
+
+  return { key_id: data.key_id, key_name: data.key_name };
+}
+
+// =========================================================
+// Rate limiting (simple per-key counter in api_request_logs)
+// =========================================================
+
+async function checkRateLimit(supabase: ReturnType<typeof createClient>, keyId: string): Promise<{ allowed: boolean; remaining: number }> {
+  const oneMinuteAgo = new Date(Date.now() - 60_000).toISOString();
+  const { count, error } = await supabase
+    .from("api_request_logs")
+    .select("*", { count: "exact", head: true })
+    .eq("api_key_id", keyId)
+    .gte("created_at", oneMinuteAgo);
+
+  if (error) return { allowed: true, remaining: RATE_LIMIT_PER_KEY };
+  const current = count ?? 0;
+  return { allowed: current < RATE_LIMIT_PER_KEY, remaining: Math.max(0, RATE_LIMIT_PER_KEY - current) };
+}
+
+// =========================================================
+// Request logging
+// =========================================================
+
+async function logRequest(
+  supabase: ReturnType<typeof createClient>,
+  requestId: string,
+  apiKey: ApiKeyInfo | null,
+  endpoint: string,
+  method: string,
+  statusCode: number,
+  ip: string | null,
+  durationMs: number,
+  errorMessage: string | null
+): Promise<void> {
+  try {
+    await supabase.rpc("log_api_request", {
+      p_request_id: requestId,
+      p_api_key_id: apiKey?.key_id ?? null,
+      p_key_name: apiKey?.key_name ?? null,
+      p_endpoint: endpoint,
+      p_method: method,
+      p_status_code: statusCode,
+      p_ip_address: ip,
+      p_duration_ms: durationMs,
+      p_error_message: errorMessage,
+    });
+  } catch {
+    // Logging failure should not block the request
+  }
+}
+
+// =========================================================
+// Route handlers
+// =========================================================
+
+// --- Health ---
+function handleHealth(requestId: string): Response {
+  return successResponse({ status: "ok", timestamp: new Date().toISOString() });
+}
+
+// --- Whoami ---
+function handleWhoami(apiKey: ApiKeyInfo, requestId: string): Response {
+  return successResponse({ key_id: apiKey.key_id, key_name: apiKey.key_name, access: "full_admin" });
+}
+
+// --- Dashboard ---
+async function handleDashboard(supabase: ReturnType<typeof createClient>, requestId: string): Promise<Response> {
+  const { data, error } = await supabase.rpc("api_dashboard_stats");
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch dashboard stats", requestId, 500);
+  return successResponse(data);
+}
+
+// --- Sales ---
+async function handleSalesList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const page = parseInt(url.searchParams.get("page") || "1");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
+  const search = url.searchParams.get("search");
+  const paymentStatus = url.searchParams.get("payment_status");
+  const fulfilmentStatus = url.searchParams.get("fulfilment_status");
+  const offset = (page - 1) * limit;
+
+  let query = supabase
+    .from("sales")
+    .select(`
+      id, sale_number, customer_id, product_name_snapshot, plan_name_snapshot,
+      purchase_type_snapshot, final_selling_price, amount_received, payment_fee,
+      sale_date, payment_status, fulfilment_status,
+      payment_method, transaction_reference, note, created_at, updated_at,
+      customers ( id, name, phone_display, email )
+    `, { count: "exact" })
+    .is("archived_at", null)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (search) {
+    query = query.or(`sale_number.ilike.%${search}%,product_name_snapshot.ilike.%${search}%,customers.name.ilike.%${search}%`);
+  }
+  if (paymentStatus) query = query.eq("payment_status", paymentStatus);
+  if (fulfilmentStatus) query = query.eq("fulfilment_status", fulfilmentStatus);
+
+  const { data, error, count } = await query;
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch sales", requestId, 500);
+
+  return successResponse({
+    sales: data ?? [],
+    pagination: { page, limit, total: count ?? 0, has_more: (count ?? 0) > offset + limit },
+  });
+}
+
+async function handleSaleDetail(supabase: ReturnType<typeof createClient>, saleId: string, requestId: string): Promise<Response> {
+  const { data: sale, error } = await supabase
+    .from("sales")
+    .select(`
+      *,
+      customers ( id, name, phone_display, email, customer_type ),
+      payments ( id, amount, payment_method, transaction_reference, payment_date, status, note, created_at )
+    `)
+    .eq("id", saleId)
+    .is("archived_at", null)
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch sale", requestId, 500);
+  if (!sale) return errorResponse("NOT_FOUND", "Sale not found", requestId, 404);
+
+  // Fetch subscription and renewal if recurring
+  let subscription = null;
+  let renewal = null;
+  if (sale.purchase_type_snapshot === "recurring") {
+    const { data: sub } = await supabase
+      .from("subscriptions")
+      .select("*")
+      .eq("current_sale_id", saleId)
+      .maybeSingle();
+    subscription = sub;
+    if (sub) {
+      const { data: ren } = await supabase
+        .from("renewals")
+        .select("*")
+        .eq("subscription_id", sub.id)
+        .maybeSingle();
+      renewal = ren;
+    }
+  }
+
+  return successResponse({ sale: { ...sale, payments: sale.payments ?? [], subscription, renewal } });
+}
+
+async function handleSaleCreate(supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  // Get the owner profile to use as actor
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (!owner) return errorResponse("INTERNAL_ERROR", "No active owner found", requestId, 500);
+
+  const { data, error } = await supabase.rpc("api_create_sale", {
+    p_payload: body,
+    p_actor_id: owner.id,
+  });
+  if (error) {
+    const msg = error.message || "Failed to create sale";
+    if (msg.includes("VALIDATION_ERROR") || msg.includes("NOT_FOUND") || msg.includes("BUSINESS_RULE")) {
+      const cleanMsg = msg.replace(/^(VALIDATION_ERROR|NOT_FOUND|BUSINESS_RULE_ERROR):\s*/, "");
+      return errorResponse("VALIDATION_ERROR", cleanMsg, requestId, 422);
+    }
+    return errorResponse("INTERNAL_ERROR", msg, requestId, 500);
+  }
+  return successResponse(data, 201);
+}
+
+async function handleFulfilmentUpdate(supabase: ReturnType<typeof createClient>, saleId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  const allowedStatuses = ["payment_confirmation", "activation_pending", "processing", "activated", "replacement_required", "completed"];
+  if (!body.fulfilment_status || !allowedStatuses.includes(body.fulfilment_status)) {
+    return errorResponse("VALIDATION_ERROR", "Invalid fulfilment_status", requestId, 422);
+  }
+
+  const { data, error } = await supabase
+    .from("sales")
+    .update({
+      fulfilment_status: body.fulfilment_status,
+      note: body.note ?? undefined,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", saleId)
+    .is("archived_at", null)
+    .select("id, sale_number, fulfilment_status")
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to update fulfilment", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Sale not found", requestId, 404);
+  return successResponse(data);
+}
+
+// --- Payments ---
+async function handlePaymentCreate(supabase: ReturnType<typeof createClient>, saleId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  if (!body.amount || body.amount <= 0) {
+    return errorResponse("VALIDATION_ERROR", "Amount must be greater than zero", requestId, 422);
+  }
+
+  // Get the owner profile to use as actor
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (!owner) return errorResponse("INTERNAL_ERROR", "No active owner found", requestId, 500);
+
+  const { data, error } = await supabase.rpc("api_add_payment", {
+    p_sale_id: saleId,
+    p_amount: body.amount,
+    p_actor_id: owner.id,
+    p_payment_method: body.payment_method ?? null,
+    p_transaction_reference: body.transaction_reference ?? null,
+    p_payment_date: body.payment_date ?? null,
+    p_note: body.note ?? null,
+  });
+
+  if (error) {
+    const msg = error.message || "Failed to add payment";
+    if (msg.includes("NOT_FOUND")) return errorResponse("NOT_FOUND", msg, requestId, 404);
+    if (msg.includes("BUSINESS_RULE")) return errorResponse("BUSINESS_RULE_ERROR", msg.replace(/^BUSINESS_RULE_ERROR:\s*/, ""), requestId, 422);
+    if (msg.includes("VALIDATION")) return errorResponse("VALIDATION_ERROR", msg.replace(/^VALIDATION_ERROR:\s*/, ""), requestId, 422);
+    return errorResponse("INTERNAL_ERROR", msg, requestId, 500);
+  }
+  return successResponse(data, 201);
+}
+
+// --- Customers ---
+async function handleCustomersList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const page = parseInt(url.searchParams.get("page") || "1");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
+  const search = url.searchParams.get("search");
+  const offset = (page - 1) * limit;
+
+  let query = supabase
+    .from("customers")
+    .select("id, name, phone_display, email, customer_type, created_at, updated_at, archived_at", { count: "exact" })
+    .is("archived_at", null)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (search) {
+    query = query.or(`name.ilike.%${search}%,phone_display.ilike.%${search}%,email.ilike.%${search}%`);
+  }
+
+  const { data, error, count } = await query;
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch customers", requestId, 500);
+
+  return successResponse({
+    customers: data ?? [],
+    pagination: { page, limit, total: count ?? 0, has_more: (count ?? 0) > offset + limit },
+  });
+}
+
+async function handleCustomerDetail(supabase: ReturnType<typeof createClient>, customerId: string, requestId: string): Promise<Response> {
+  const { data, error } = await supabase
+    .from("customers")
+    .select("*")
+    .eq("id", customerId)
+    .is("archived_at", null)
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch customer", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Customer not found", requestId, 404);
+
+  // Fetch recent sales for this customer
+  const { data: sales } = await supabase
+    .from("sales")
+    .select("id, sale_number, product_name_snapshot, final_selling_price, payment_status, fulfilment_status, sale_date")
+    .eq("customer_id", customerId)
+    .is("archived_at", null)
+    .order("sale_date", { ascending: false })
+    .limit(20);
+
+  return successResponse({ customer: data, recent_sales: sales ?? [] });
+}
+
+async function handleCustomerCreate(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  if (!body.name || !body.phone) {
+    return errorResponse("VALIDATION_ERROR", "Name and phone are required", requestId, 422);
+  }
+
+  // Normalize phone using the RPC
+  const { data: normalized, error: normError } = await supabase.rpc("normalize_phone", { raw: body.phone });
+  if (normError || !normalized) {
+    return errorResponse("VALIDATION_ERROR", "Invalid phone number", requestId, 422);
+  }
+
+  // Check if customer already exists
+  const { data: existing } = await supabase
+    .from("customers")
+    .select("id")
+    .eq("phone_normalized", normalized)
+    .maybeSingle();
+
+  if (existing) {
+    return successResponse({ customer_id: existing.id, created: false });
+  }
+
+  // Get the owner profile to set as created_by
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from("customers")
+    .insert({
+      name: body.name,
+      phone_normalized: normalized,
+      phone_display: body.phone,
+      phone_country_code: "",
+      email: body.email ?? null,
+      customer_type: body.customer_type ?? "retail",
+      acquisition_source: body.acquisition_source ?? null,
+      created_by: owner?.id ?? null,
+    })
+    .select("id, name, phone_display, email, customer_type, created_at")
+    .single();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to create customer", requestId, 500);
+  return successResponse({ customer: data, created: true }, 201);
+}
+
+async function handleCustomerUpdate(supabase: ReturnType<typeof createClient>, customerId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  const allowedFields: Record<string, string> = {
+    name: "name", email: "email", customer_type: "customer_type",
+    internal_note: "internal_note", marketing_allowed: "marketing_allowed",
+    do_not_message: "do_not_message",
+  };
+
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  for (const [key, col] of Object.entries(allowedFields)) {
+    if (body[key] !== undefined) update[col] = body[key];
+  }
+  if (body.tags !== undefined) update.tags = body.tags;
+
+  if (Object.keys(update).length <= 1) {
+    return errorResponse("VALIDATION_ERROR", "No updatable fields provided", requestId, 422);
+  }
+
+  const { data, error } = await supabase
+    .from("customers")
+    .update(update)
+    .eq("id", customerId)
+    .is("archived_at", null)
+    .select("id, name, phone_display, email, customer_type, tags, internal_note, marketing_allowed, do_not_message, updated_at")
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to update customer", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Customer not found", requestId, 404);
+  return successResponse(data);
+}
+
+// --- Products ---
+async function handleProductsList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const includePlans = url.searchParams.get("include_plans") !== "false";
+
+  let select = "id, name, category_id, description, supplier_name, is_active, created_at, updated_at";
+  if (includePlans) {
+    select += ", product_plans ( id, plan_name, purchase_type, duration_days, warranty_days, default_cost_price, default_selling_price, optional_list_price, is_active )";
+  }
+
+  const { data, error } = await supabase
+    .from("products")
+    .select(select)
+    .is("archived_at", null)
+    .order("created_at", { ascending: false });
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch products", requestId, 500);
+  return successResponse({ products: data ?? [] });
+}
+
+async function handleProductCreate(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  if (!body.name) return errorResponse("VALIDATION_ERROR", "Product name is required", requestId, 422);
+
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from("products")
+    .insert({
+      name: body.name,
+      category_id: body.category_id ?? null,
+      description: body.description ?? null,
+      supplier_name: body.supplier_name ?? null,
+      is_active: body.is_active ?? true,
+      created_by: owner?.id ?? null,
+    })
+    .select("id, name, category_id, description, supplier_name, is_active, created_at")
+    .single();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to create product", requestId, 500);
+  return successResponse(data, 201);
+}
+
+async function handleProductUpdate(supabase: ReturnType<typeof createClient>, productId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  const allowedFields: Record<string, string> = {
+    name: "name", category_id: "category_id", description: "description",
+    supplier_name: "supplier_name", is_active: "is_active",
+  };
+
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  for (const [key, col] of Object.entries(allowedFields)) {
+    if (body[key] !== undefined) update[col] = body[key];
+  }
+
+  const { data, error } = await supabase
+    .from("products")
+    .update(update)
+    .eq("id", productId)
+    .is("archived_at", null)
+    .select("id, name, category_id, description, supplier_name, is_active, updated_at")
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to update product", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Product not found", requestId, 404);
+  return successResponse(data);
+}
+
+// --- Product Plans ---
+async function handleProductPlanCreate(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  if (!body.product_id || !body.plan_name) {
+    return errorResponse("VALIDATION_ERROR", "product_id and plan_name are required", requestId, 422);
+  }
+
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from("product_plans")
+    .insert({
+      product_id: body.product_id,
+      plan_name: body.plan_name,
+      purchase_type: body.purchase_type ?? "one_time",
+      duration_days: body.duration_days ?? null,
+      warranty_days: body.warranty_days ?? null,
+      default_cost_price: body.default_cost_price ?? 0,
+      default_selling_price: body.default_selling_price ?? 0,
+      optional_list_price: body.optional_list_price ?? null,
+      optional_stock_count: body.optional_stock_count ?? null,
+      low_stock_threshold: body.low_stock_threshold ?? 0,
+      is_active: body.is_active ?? true,
+      created_by: owner?.id ?? null,
+    })
+    .select("id, product_id, plan_name, purchase_type, duration_days, warranty_days, default_cost_price, default_selling_price, is_active, created_at")
+    .single();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to create product plan", requestId, 500);
+  return successResponse(data, 201);
+}
+
+async function handleProductPlanUpdate(supabase: ReturnType<typeof createClient>, planId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  const allowedFields: Record<string, string> = {
+    plan_name: "plan_name", purchase_type: "purchase_type",
+    duration_days: "duration_days", warranty_days: "warranty_days",
+    default_cost_price: "default_cost_price", default_selling_price: "default_selling_price",
+    optional_list_price: "optional_list_price", optional_stock_count: "optional_stock_count",
+    low_stock_threshold: "low_stock_threshold", is_active: "is_active",
+  };
+
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  for (const [key, col] of Object.entries(allowedFields)) {
+    if (body[key] !== undefined) update[col] = body[key];
+  }
+
+  const { data, error } = await supabase
+    .from("product_plans")
+    .update(update)
+    .eq("id", planId)
+    .is("archived_at", null)
+    .select("id, plan_name, purchase_type, default_cost_price, default_selling_price, is_active, updated_at")
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to update product plan", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Product plan not found", requestId, 404);
+  return successResponse(data);
+}
+
+// --- Categories ---
+async function handleCategoriesList(supabase: ReturnType<typeof createClient>, requestId: string): Promise<Response> {
+  const { data, error } = await supabase
+    .from("categories")
+    .select("id, name, colour, created_at")
+    .is("archived_at", null)
+    .order("name", { ascending: true });
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch categories", requestId, 500);
+  return successResponse({ categories: data ?? [] });
+}
+
+async function handleCategoryCreate(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  if (!body.name) return errorResponse("VALIDATION_ERROR", "Category name is required", requestId, 422);
+
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("role", "owner")
+    .eq("is_active", true)
+    .maybeSingle();
+
+  const { data, error } = await supabase
+    .from("categories")
+    .insert({
+      name: body.name,
+      colour: body.colour ?? "#6366f1",
+      created_by: owner?.id ?? null,
+    })
+    .select("id, name, colour, created_at")
+    .single();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to create category", requestId, 500);
+  return successResponse(data, 201);
+}
+
+async function handleCategoryUpdate(supabase: ReturnType<typeof createClient>, categoryId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  const update: Record<string, unknown> = {};
+  if (body.name !== undefined) update.name = body.name;
+  if (body.colour !== undefined) update.colour = body.colour;
+
+  if (Object.keys(update).length === 0) {
+    return errorResponse("VALIDATION_ERROR", "No updatable fields provided", requestId, 422);
+  }
+
+  const { data, error } = await supabase
+    .from("categories")
+    .update(update)
+    .eq("id", categoryId)
+    .is("archived_at", null)
+    .select("id, name, colour")
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to update category", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Category not found", requestId, 404);
+  return successResponse(data);
+}
+
+// --- Renewals ---
+async function handleRenewalsList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const page = parseInt(url.searchParams.get("page") || "1");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
+  const status = url.searchParams.get("status");
+  const offset = (page - 1) * limit;
+
+  let query = supabase
+    .from("renewals")
+    .select(`
+      id, subscription_id, customer_id, due_date, status, snoozed_until, note, created_at, updated_at,
+      customers ( id, name, phone_display, email ),
+      subscriptions ( id, product_plan_id, start_date, end_date, status, next_renewal_date )
+    `, { count: "exact" })
+    .order("due_date", { ascending: true })
+    .range(offset, offset + limit - 1);
+
+  if (status) query = query.eq("status", status);
+
+  const { data, error, count } = await query;
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch renewals", requestId, 500);
+
+  return successResponse({
+    renewals: data ?? [],
+    pagination: { page, limit, total: count ?? 0, has_more: (count ?? 0) > offset + limit },
+  });
+}
+
+async function handleRenewalUpdate(supabase: ReturnType<typeof createClient>, renewalId: string, req: Request, requestId: string): Promise<Response> {
+  let body;
+  try { body = await req.json(); } catch { return errorResponse("VALIDATION_ERROR", "Invalid JSON body", requestId, 422); }
+
+  const allowedStatuses = ["pending", "reminded", "interested", "awaiting_payment", "snoozed", "no_response", "renewed", "not_renewing"];
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+  if (body.status !== undefined) {
+    if (!allowedStatuses.includes(body.status)) {
+      return errorResponse("VALIDATION_ERROR", "Invalid renewal status", requestId, 422);
+    }
+    update.status = body.status;
+  }
+  if (body.snoozed_until !== undefined) update.snoozed_until = body.snoozed_until;
+  if (body.note !== undefined) update.note = body.note;
+
+  if (Object.keys(update).length <= 1) {
+    return errorResponse("VALIDATION_ERROR", "No updatable fields provided", requestId, 422);
+  }
+
+  const { data, error } = await supabase
+    .from("renewals")
+    .update(update)
+    .eq("id", renewalId)
+    .select("id, status, snoozed_until, note, updated_at")
+    .maybeSingle();
+
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to update renewal", requestId, 500);
+  if (!data) return errorResponse("NOT_FOUND", "Renewal not found", requestId, 404);
+  return successResponse(data);
+}
+
+// --- Subscriptions ---
+async function handleSubscriptionsList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const page = parseInt(url.searchParams.get("page") || "1");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
+  const status = url.searchParams.get("status");
+  const offset = (page - 1) * limit;
+
+  let query = supabase
+    .from("subscriptions")
+    .select(`
+      id, customer_id, original_sale_id, current_sale_id, product_plan_id,
+      start_date, end_date, status, next_renewal_date, created_at, updated_at,
+      customers ( id, name, phone_display, email )
+    `, { count: "exact" })
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (status) query = query.eq("status", status);
+
+  const { data, error, count } = await query;
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch subscriptions", requestId, 500);
+
+  return successResponse({
+    subscriptions: data ?? [],
+    pagination: { page, limit, total: count ?? 0, has_more: (count ?? 0) > offset + limit },
+  });
+}
+
+// --- Reports ---
+async function handleReportsSummary(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+  const url = new URL(req.url);
+  const fromDate = url.searchParams.get("from") || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split("T")[0];
+  const toDate = url.searchParams.get("to") || new Date().toISOString().split("T")[0];
+
+  const { data, error } = await supabase.rpc("api_dashboard_stats");
+  if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch reports", requestId, 500);
+  return successResponse(data);
+}
+
+// =========================================================
+// Router
+// =========================================================
+
 interface RouteMatch {
-  route: string;
-  action: string;
-  requiresAuth: boolean;
-  scope: string | null;
-  handler: (req: Request, supabase: ReturnType<typeof createClient>, auditCtx: AuditContext, apiKeyInfo: ApiKeyInfo, corsHeaders: Record<string, string>, pathParam?: string) => Promise<Response>;
+  handler: (supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string, pathParam?: string) => Promise<Response>;
   pathParam?: string;
+  requiresAuth: boolean;
 }
 
 function matchRoute(path: string, method: string): RouteMatch | null {
   // Public routes
   if (path === "/v1/health" && method === "GET") {
-    return {
-      route: "/v1/health", action: "health_check", requiresAuth: false, scope: null,
-      handler: async (req, _supabase, auditCtx, _apiKeyInfo, corsHeaders) => handleHealth(req, auditCtx, corsHeaders),
-    };
+    return { requiresAuth: false, handler: async () => Promise.resolve(handleHealth(generateRequestId())) };
   }
 
   // Authenticated routes
   if (path === "/v1/whoami" && method === "GET") {
-    return {
-      route: "/v1/whoami", action: "key_validate", requiresAuth: true, scope: null,
-      handler: async (req, _supabase, auditCtx, apiKeyInfo, corsHeaders) => handleWhoami(req, auditCtx, apiKeyInfo, corsHeaders),
-    };
+    return { requiresAuth: true, handler: async (_s, _r, apiKey, requestId) => Promise.resolve(handleWhoami(apiKey, requestId)) };
+  }
+  if (path === "/v1/dashboard" && method === "GET") {
+    return { requiresAuth: true, handler: async (s, _r, _a, requestId) => handleDashboard(s, requestId) };
   }
 
-  if (path === "/v1/catalog/products" && method === "GET") {
-    return {
-      route: "/v1/catalog/products", action: "catalog_read", requiresAuth: true, scope: "catalog:read",
-      handler: handleCatalogProducts,
-    };
-  }
-
-  // Customers: GET (list), POST (create), GET/:id (detail), PATCH/:id (update)
-  if (path === "/v1/customers" && method === "GET") {
-    return {
-      route: "/v1/customers", action: "customers_read", requiresAuth: true, scope: "customers:read",
-      handler: handleCustomerSearch,
-    };
-  }
-  if (path === "/v1/customers" && method === "POST") {
-    return {
-      route: "/v1/customers", action: "customer_create", requiresAuth: true, scope: "customers:create",
-      handler: handleCustomerCreate,
-    };
-  }
-
-  const customerMatch = path.match(/^\/v1\/customers\/([^/]+)$/);
-  if (customerMatch && method === "GET") {
-    return {
-      route: "/v1/customers/:id", action: "customer_detail", requiresAuth: true, scope: "customers:read",
-      handler: handleCustomerDetail, pathParam: customerMatch[1],
-    };
-  }
-  if (customerMatch && method === "PATCH") {
-    return {
-      route: "/v1/customers/:id", action: "customer_update", requiresAuth: true, scope: "customers:update",
-      handler: handleCustomerUpdate, pathParam: customerMatch[1],
-    };
-  }
-
-  // Sales: GET (list), POST (create), GET/:id (detail)
+  // Sales
   if (path === "/v1/sales" && method === "GET") {
-    return {
-      route: "/v1/sales", action: "sales_read", requiresAuth: true, scope: "sales:read",
-      handler: handleSaleSearch,
-    };
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleSalesList(s, r, requestId) };
   }
   if (path === "/v1/sales" && method === "POST") {
-    return {
-      route: "/v1/sales", action: "sale_create", requiresAuth: true, scope: "sales:create",
-      handler: handleSaleCreate,
-    };
+    return { requiresAuth: true, handler: async (s, r, a, requestId) => handleSaleCreate(s, r, a, requestId) };
   }
-
   const saleMatch = path.match(/^\/v1\/sales\/([^/]+)$/);
   if (saleMatch && method === "GET") {
-    return {
-      route: "/v1/sales/:id", action: "sale_detail", requiresAuth: true, scope: "sales:read",
-      handler: handleSaleDetail, pathParam: saleMatch[1],
-    };
+    return { requiresAuth: true, pathParam: saleMatch[1], handler: async (s, _r, _a, requestId, id) => handleSaleDetail(s, id!, requestId) };
+  }
+  if (saleMatch && method === "PATCH") {
+    return { requiresAuth: true, pathParam: saleMatch[1], handler: async (s, r, _a, requestId, id) => handleFulfilmentUpdate(s, id!, r, requestId) };
   }
 
-  // Payments: POST /v1/sales/:id/payments
+  // Payments
   const paymentMatch = path.match(/^\/v1\/sales\/([^/]+)\/payments$/);
   if (paymentMatch && method === "POST") {
-    return {
-      route: "/v1/sales/:id/payments", action: "payment_create", requiresAuth: true, scope: "payments:create",
-      handler: handlePaymentCreate, pathParam: paymentMatch[1],
-    };
+    return { requiresAuth: true, pathParam: paymentMatch[1], handler: async (s, r, _a, requestId, id) => handlePaymentCreate(s, id!, r, requestId) };
   }
 
-  // Fulfilment: PATCH /v1/sales/:id/fulfilment
-  const fulfilmentMatch = path.match(/^\/v1\/sales\/([^/]+)\/fulfilment$/);
-  if (fulfilmentMatch && method === "PATCH") {
-    return {
-      route: "/v1/sales/:id/fulfilment", action: "fulfilment_update", requiresAuth: true, scope: "fulfilment:update",
-      handler: handleFulfilmentUpdate, pathParam: fulfilmentMatch[1],
-    };
+  // Customers
+  if (path === "/v1/customers" && method === "GET") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleCustomersList(s, r, requestId) };
+  }
+  if (path === "/v1/customers" && method === "POST") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleCustomerCreate(s, r, requestId) };
+  }
+  const customerMatch = path.match(/^\/v1\/customers\/([^/]+)$/);
+  if (customerMatch && method === "GET") {
+    return { requiresAuth: true, pathParam: customerMatch[1], handler: async (s, _r, _a, requestId, id) => handleCustomerDetail(s, id!, requestId) };
+  }
+  if (customerMatch && method === "PATCH") {
+    return { requiresAuth: true, pathParam: customerMatch[1], handler: async (s, r, _a, requestId, id) => handleCustomerUpdate(s, id!, r, requestId) };
   }
 
-  // Renewals: GET (list), PATCH/:id (update)
+  // Products
+  if (path === "/v1/products" && method === "GET") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleProductsList(s, r, requestId) };
+  }
+  if (path === "/v1/products" && method === "POST") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleProductCreate(s, r, requestId) };
+  }
+  const productMatch = path.match(/^\/v1\/products\/([^/]+)$/);
+  if (productMatch && method === "PATCH") {
+    return { requiresAuth: true, pathParam: productMatch[1], handler: async (s, r, _a, requestId, id) => handleProductUpdate(s, id!, r, requestId) };
+  }
+
+  // Product Plans
+  if (path === "/v1/product-plans" && method === "POST") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleProductPlanCreate(s, r, requestId) };
+  }
+  const planMatch = path.match(/^\/v1\/product-plans\/([^/]+)$/);
+  if (planMatch && method === "PATCH") {
+    return { requiresAuth: true, pathParam: planMatch[1], handler: async (s, r, _a, requestId, id) => handleProductPlanUpdate(s, id!, r, requestId) };
+  }
+
+  // Categories
+  if (path === "/v1/categories" && method === "GET") {
+    return { requiresAuth: true, handler: async (s, _r, _a, requestId) => handleCategoriesList(s, requestId) };
+  }
+  if (path === "/v1/categories" && method === "POST") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleCategoryCreate(s, r, requestId) };
+  }
+  const categoryMatch = path.match(/^\/v1\/categories\/([^/]+)$/);
+  if (categoryMatch && method === "PATCH") {
+    return { requiresAuth: true, pathParam: categoryMatch[1], handler: async (s, r, _a, requestId, id) => handleCategoryUpdate(s, id!, r, requestId) };
+  }
+
+  // Renewals
   if (path === "/v1/renewals" && method === "GET") {
-    return {
-      route: "/v1/renewals", action: "renewals_read", requiresAuth: true, scope: "renewals:read",
-      handler: handleRenewalSearch,
-    };
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleRenewalsList(s, r, requestId) };
   }
-
   const renewalMatch = path.match(/^\/v1\/renewals\/([^/]+)$/);
   if (renewalMatch && method === "PATCH") {
-    return {
-      route: "/v1/renewals/:id", action: "renewal_update", requiresAuth: true, scope: "renewals:update",
-      handler: handleRenewalUpdate, pathParam: renewalMatch[1],
-    };
+    return { requiresAuth: true, pathParam: renewalMatch[1], handler: async (s, r, _a, requestId, id) => handleRenewalUpdate(s, id!, r, requestId) };
   }
 
+  // Subscriptions
+  if (path === "/v1/subscriptions" && method === "GET") {
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleSubscriptionsList(s, r, requestId) };
+  }
+
+  // Reports
   if (path === "/v1/reports/summary" && method === "GET") {
-    return {
-      route: "/v1/reports/summary", action: "reports_read", requiresAuth: true, scope: "reports:read",
-      handler: handleReportsSummary,
-    };
+    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleReportsSummary(s, r, requestId) };
   }
 
   return null;
 }
 
+// =========================================================
+// Main handler
+// =========================================================
+
 Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders });
+  }
+
   const url = new URL(req.url);
   const path = url.pathname
     .replace(/^\/functions\/v1\/digixodesk-api/, "")
     .replace(/^\/digixodesk-api/, "");
 
-  const corsHeaders = getCorsHeaders(req);
-
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
-  }
-
+  const requestId = generateRequestId();
+  const ip = getClientIP(req);
+  const startTime = Date.now();
   const supabase = createServiceClient();
 
   const routeMatch = matchRoute(path, req.method);
   if (!routeMatch) {
-    const auditCtx = createAuditContext(req, path, "unknown");
-    const { body, status } = errorResponse("NOT_FOUND", "Endpoint not found", auditCtx.requestId, 404);
-    await logAudit(supabase, auditCtx, status, "error", "Endpoint not found");
-    return jsonResponse(body, status, { ...corsHeaders, "X-Request-ID": auditCtx.requestId });
-  }
-
-  const { route, action, requiresAuth, scope, handler, pathParam } = routeMatch;
-  const auditCtx = createAuditContext(req, route, action);
-
-  try {
-    await maybeCleanupRateLimits(supabase);
-  } catch {
-    // Cleanup failure should not block the request
+    const resp = errorResponse("NOT_FOUND", "Endpoint not found", requestId, 404);
+    await logRequest(supabase, requestId, null, path, req.method, 404, ip, Date.now() - startTime, "Endpoint not found");
+    return resp;
   }
 
   try {
-    let rateBucket: string;
-    let rateLimit: number;
+    let apiKey: ApiKeyInfo | null = null;
 
-    if (!requiresAuth) {
-      const ip = auditCtx.ipAddress || "unknown";
-      rateBucket = `ip:${ip}`;
-      rateLimit = RATE_LIMIT_PER_IP;
-    } else {
-      const token = extractBearerToken(req);
-      if (!token) {
-        const { body, status } = errorResponse("UNAUTHORIZED", "Missing or invalid Authorization header", auditCtx.requestId, 401);
-        await logAudit(supabase, auditCtx, status, "auth_error", "Missing Authorization header");
-        return jsonResponse(body, status, { ...corsHeaders, "X-Request-ID": auditCtx.requestId });
+    if (routeMatch.requiresAuth) {
+      apiKey = await authenticate(req, supabase);
+      if (!apiKey) {
+        const resp = errorResponse("UNAUTHORIZED", "Invalid or missing API key", requestId, 401);
+        await logRequest(supabase, requestId, null, path, req.method, 401, ip, Date.now() - startTime, "Authentication failed");
+        return resp;
       }
 
-      const encoder = new TextEncoder();
-      const hashData = await crypto.subtle.digest("SHA-256", encoder.encode(token));
-      const tokenHash = Array.from(new Uint8Array(hashData)).map((b) => b.toString(16).padStart(2, "0")).join("");
-      rateBucket = `key:${tokenHash.slice(0, 16)}`;
-      rateLimit = RATE_LIMIT_PER_KEY;
-    }
-
-    const rateResult = await checkRateLimit(supabase, rateBucket, rateLimit);
-    if (!rateResult.allowed) {
-      const { body, status } = errorResponse("RATE_LIMITED", "Rate limit exceeded", auditCtx.requestId, 429);
-      await logAudit(supabase, auditCtx, status, "rate_limited", "Rate limit exceeded");
-      return jsonResponse(body, status, {
-        ...corsHeaders,
-        "X-Request-ID": auditCtx.requestId,
-        "Retry-After": String(rateResult.retryAfter),
-        "X-RateLimit-Remaining": "0",
-      });
-    }
-
-    let apiKeyInfo: ApiKeyInfo | null = null;
-    if (requiresAuth) {
-      const token = extractBearerToken(req);
-      if (!token) {
-        const { body, status } = errorResponse("UNAUTHORIZED", "Missing or invalid Authorization header", auditCtx.requestId, 401);
-        await logAudit(supabase, auditCtx, status, "auth_error", "Missing Authorization header");
-        return jsonResponse(body, status, { ...corsHeaders, "X-Request-ID": auditCtx.requestId });
-      }
-
-      apiKeyInfo = await validateApiKey(supabase, token);
-      if (!apiKeyInfo) {
-        const { body, status } = errorResponse("UNAUTHORIZED", "Invalid or expired API key", auditCtx.requestId, 401);
-        await logAudit(supabase, auditCtx, status, "auth_error", "Invalid or expired API key");
-        return jsonResponse(body, status, { ...corsHeaders, "X-Request-ID": auditCtx.requestId });
-      }
-
-      auditCtx.apiKeyId = apiKeyInfo.id;
-      touchLastUsed(supabase, apiKeyInfo.id).catch(() => {});
-
-      // Scope check (in-memory, no DB round trip)
-      if (scope) {
-        const scopeError = requireScope(apiKeyInfo, scope, auditCtx, corsHeaders);
-        if (scopeError) {
-          await logAudit(supabase, auditCtx, scopeError.status, "error", `Missing scope: ${scope}`);
-          return scopeError;
-        }
+      // Rate limit check
+      const rateCheck = await checkRateLimit(supabase, apiKey.key_id);
+      if (!rateCheck.allowed) {
+        const resp = errorResponse("RATE_LIMITED", "Rate limit exceeded", requestId, 429);
+        await logRequest(supabase, requestId, apiKey, path, req.method, 429, ip, Date.now() - startTime, "Rate limited");
+        return resp;
       }
     }
 
-    let response: Response;
-    if (pathParam) {
-      response = await handler(req, supabase, auditCtx, apiKeyInfo!, corsHeaders, pathParam);
-    } else {
-      response = await handler(req, supabase, auditCtx, apiKeyInfo!, corsHeaders);
-    }
+    const response = await routeMatch.handler(supabase, req, apiKey!, requestId, routeMatch.pathParam);
 
-    response.headers.set("X-RateLimit-Remaining", String(rateResult.remaining));
-
-    await logAudit(supabase, auditCtx, response.status, response.status < 400 ? "success" : "error", null);
+    await logRequest(supabase, requestId, apiKey, path, req.method, response.status, ip, Date.now() - startTime, null);
 
     return response;
   } catch (err) {
-    const redactedMsg = redactError(err);
-    const { body, status } = errorResponse("INTERNAL_ERROR", "Internal error", auditCtx.requestId, 500);
-    await logAudit(supabase, auditCtx, status, "error", redactedMsg);
-    return jsonResponse(body, status, { ...corsHeaders, "X-Request-ID": auditCtx.requestId });
+    const errMsg = err instanceof Error ? err.message : "Internal error";
+    const resp = errorResponse("INTERNAL_ERROR", "Internal error", requestId, 500);
+    await logRequest(supabase, requestId, null, path, req.method, 500, ip, Date.now() - startTime, errMsg);
+    return resp;
   }
 });
