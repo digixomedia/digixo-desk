@@ -350,8 +350,9 @@ GRANT EXECUTE ON FUNCTION public.complete_renewal(uuid,jsonb,text) TO authentica
 -- -----------------------------------------------------------------------------
 ALTER TABLE public.api_keys ALTER COLUMN permissions SET DEFAULT '[]'::jsonb;
 DROP FUNCTION IF EXISTS public.create_api_key(text,timestamptz);
+DROP FUNCTION IF EXISTS public.create_api_key(text,timestamptz,text[]);
 
-CREATE OR REPLACE FUNCTION public.create_api_key(p_name text,p_expires_at timestamptz,p_permissions text[])
+CREATE FUNCTION public.create_api_key(p_name text,p_expires_at timestamptz,p_permissions text[])
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=''
 AS $function$
 DECLARE v_id uuid; v_raw text; v_hash text; v_prefix text; v_allowed constant text[]:=ARRAY['*','dashboard:read','sales:read','sales:write','payments:read','payments:write','customers:read','customers:write','products:read','products:write','categories:read','categories:write','renewals:read','renewals:write','subscriptions:read','reports:read'];
