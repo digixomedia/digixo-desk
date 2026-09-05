@@ -59,6 +59,18 @@ function keyStatus(key: ApiKey): { label: string; status: string } {
   return { label: "Active", status: "activated" };
 }
 
+const limitedPermissionOptions = [
+  ["dashboard:read", "Read dashboard"], ["reports:read", "Read financial reports"],
+  ["sales:read", "Read sales"], ["sales:write", "Create/update sales"],
+  ["payments:read", "Read payment history"], ["payments:write", "Add payments"],
+  ["customers:read", "Read customers"], ["customers:write", "Create/update customers"],
+  ["products:read", "Read products"], ["products:write", "Create/update products and plans"],
+  ["categories:read", "Read categories"], ["categories:write", "Create/update categories"],
+  ["renewals:read", "Read renewals"], ["renewals:write", "Update renewal follow-up"],
+  ["subscriptions:read", "Read subscriptions"],
+] as const;
+const defaultLimitedPermissions = new Set(["dashboard:read", "sales:read", "customers:read", "products:read"]);
+
 function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
@@ -66,13 +78,7 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
   const [newKey, setNewKey] = useState<CreateApiKeyResult | null>(null);
   const [copied, setCopied] = useState(false);
   const [permMode, setPermMode] = useState<"full" | "limited">("full");
-  const [permSalesRead, setPermSalesRead] = useState(true);
-  const [permSalesWrite, setPermSalesWrite] = useState(false);
-  const [permCustomersRead, setPermCustomersRead] = useState(true);
-  const [permCustomersWrite, setPermCustomersWrite] = useState(false);
-  const [permProductsRead, setPermProductsRead] = useState(true);
-  const [permPaymentsWrite, setPermPaymentsWrite] = useState(false);
-  const [permDashboard, setPermDashboard] = useState(true);
+  const [limitedPermissions, setLimitedPermissions] = useState<Set<string>>(() => new Set(defaultLimitedPermissions));
 
   const createKey = useMutation({
     mutationFn: async () => {
@@ -80,15 +86,7 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
       const expiresAt = expiry ? new Date(expiry + "T23:59:59").toISOString() : null;
       const permissions = permMode === "full"
         ? ["*"]
-        : [
-            ...(permSalesRead ? ["sales:read"] : []),
-            ...(permSalesWrite ? ["sales:write"] : []),
-            ...(permCustomersRead ? ["customers:read"] : []),
-            ...(permCustomersWrite ? ["customers:write"] : []),
-            ...(permProductsRead ? ["products:read"] : []),
-            ...(permPaymentsWrite ? ["payments:write"] : []),
-            ...(permDashboard ? ["dashboard:read"] : []),
-          ];
+        : Array.from(limitedPermissions);
       if (permissions.length === 0) throw new Error("Select at least one permission");
       const { data, error } = await supabase.rpc("create_api_key", {
         p_name: name.trim(),
@@ -112,6 +110,7 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
     setExpiry("");
     setCopied(false);
     setPermMode("full");
+    setLimitedPermissions(new Set(defaultLimitedPermissions));
     onOpenChange(false);
   };
 
@@ -202,14 +201,8 @@ function CreateKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: 
                 {permMode === "full" ? (
                   <p className="text-xs text-muted-foreground">Full admin access to all resources — recommended for Hermes.</p>
                 ) : (
-                  <div className="flex flex-col gap-1.5">
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permSalesRead} onChange={(e) => setPermSalesRead(e.target.checked)} /> Read sales</label>
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permSalesWrite} onChange={(e) => setPermSalesWrite(e.target.checked)} /> Create/update sales</label>
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permCustomersRead} onChange={(e) => setPermCustomersRead(e.target.checked)} /> Read customers</label>
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permCustomersWrite} onChange={(e) => setPermCustomersWrite(e.target.checked)} /> Create/update customers</label>
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permProductsRead} onChange={(e) => setPermProductsRead(e.target.checked)} /> Read products</label>
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permPaymentsWrite} onChange={(e) => setPermPaymentsWrite(e.target.checked)} /> Add payments</label>
-                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={permDashboard} onChange={(e) => setPermDashboard(e.target.checked)} /> Read dashboard</label>
+                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                    {limitedPermissionOptions.map(([permission, label]) => <label key={permission} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={limitedPermissions.has(permission)} onChange={(event) => setLimitedPermissions((current) => { const next = new Set(current); event.target.checked ? next.add(permission) : next.delete(permission); return next; })} />{label}</label>)}
                   </div>
                 )}
               </div>

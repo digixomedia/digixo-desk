@@ -1,6 +1,5 @@
-// DigiXO Desk API — Full Admin API for AI Agent Control
+// DigiXO Desk API — scoped API-key access for integrations
 // Single Edge Function handling all /v1/* routes.
-// Every valid API key has full admin access to all resources.
 // JWT verification is disabled; authentication is via API keys only.
 
 import { createClient } from "npm:@supabase/supabase-js@2.112.0";
@@ -83,7 +82,10 @@ async function authenticate(req: Request, supabase: ReturnType<typeof createClie
   // Touch last_used_at (fire and forget)
   supabase.rpc("touch_api_key_last_used", { p_key_id: data.key_id }).then(() => {});
 
-  return { key_id: data.key_id, key_name: data.key_name, permissions: data.permissions ?? ["*"] };
+  if (!Array.isArray(data.permissions) || data.permissions.length === 0 || data.permissions.some((value: unknown) => typeof value !== "string")) {
+    return null;
+  }
+  return { key_id: data.key_id, key_name: data.key_name, permissions: data.permissions };
 }
 
 // =========================================================
@@ -141,7 +143,7 @@ async function logRequest(
 
 // --- Health ---
 function handleHealth(requestId: string): Response {
-  return successResponse({ status: "ok", timestamp: new Date().toISOString() });
+  return successResponse({ status: "ok" });
 }
 
 // --- Whoami ---
@@ -151,39 +153,61 @@ function handleWhoami(apiKey: ApiKeyInfo, requestId: string): Response {
 
 // --- Dashboard ---
 async function handleDashboard(supabase: ReturnType<typeof createClient>, requestId: string): Promise<Response> {
-  const { data, error } = await supabase.rpc("api_dashboard_stats");
+  const { data, error } = await supabase.rpc("dashboard_financial_stats");
   if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch dashboard stats", requestId, 500);
-  return successResponse(data);
+  if (!Array.isArray(data) || data.length !== 1) return errorResponse("INTERNAL_ERROR", "Dashboard stats returned an invalid response", requestId, 500);
+  return successResponse(data[0]);
 }
 
 // --- Sales ---
-async function handleSalesList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+async function handleSalesList(supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
   const url = new URL(req.url);
   const page = parseInt(url.searchParams.get("page") || "1");
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
   const search = url.searchParams.get("search");
   const paymentStatus = url.searchParams.get("payment_status");
   const fulfilmentStatus = url.searchParams.get("fulfilment_status");
+  const fromDate = url.searchParams.get("from");
+  const toDate = url.searchParams.get("to");
   const offset = (page - 1) * limit;
 
-  let query = supabase
-    .from("sales")
-    .select(`
+  const includeCustomers = hasPermission(apiKey, "customers:read");
+  let matchingIds: string[] | null = null;
+  if (search?.trim()) {
+    const digits = search.replace(/\D/g, "");
+    const { data, error } = await supabase.rpc("search_sale_ids", {
+      p_search: search.trim(),
+      p_phone_digits: digits.length >= 3 ? digits : null,
+      p_include_customer: includeCustomers,
+    });
+    if (error) return errorResponse("INTERNAL_ERROR", "Failed to search sales", requestId, 500);
+    matchingIds = (data ?? []).map((row: { id: string }) => row.id);
+    if (matchingIds.length === 0) return successResponse({ sales: [], pagination: { page, limit, total: 0, has_more: false } });
+  }
+
+  const selection = `
       id, sale_number, customer_id, product_name_snapshot, plan_name_snapshot,
       purchase_type_snapshot, final_selling_price, amount_received, payment_fee,
       sale_date, payment_status, fulfilment_status,
-      payment_method, transaction_reference, note, created_at, updated_at,
-      customers ( id, name, phone_display, email )
-    `, { count: "exact" })
+      payment_method, transaction_reference, note, created_at, updated_at
+      ${includeCustomers ? ", customers ( id, name, phone_display, email )" : ""}
+    `;
+  let query = supabase
+    .from("sales")
+    .select(selection, { count: "exact" })
+    .eq("is_demo", false)
     .is("archived_at", null)
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (search) {
-    query = query.or(`sale_number.ilike.%${search}%,product_name_snapshot.ilike.%${search}%,customers.name.ilike.%${search}%`);
-  }
+  if (matchingIds) query = query.in("id", matchingIds);
   if (paymentStatus) query = query.eq("payment_status", paymentStatus);
   if (fulfilmentStatus) query = query.eq("fulfilment_status", fulfilmentStatus);
+  if (fromDate) query = query.gte("sale_date", fromDate);
+  if (toDate) {
+    const next = new Date(`${toDate}T00:00:00Z`); next.setUTCDate(next.getUTCDate() + 1);
+    query = query.lt("sale_date", next.toISOString().slice(0, 10));
+  }
 
   const { data, error, count } = await query;
   if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch sales", requestId, 500);
@@ -194,32 +218,38 @@ async function handleSalesList(supabase: ReturnType<typeof createClient>, req: R
   });
 }
 
-async function handleSaleDetail(supabase: ReturnType<typeof createClient>, saleId: string, requestId: string): Promise<Response> {
+async function handleSaleDetail(supabase: ReturnType<typeof createClient>, saleId: string, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
   const { data: sale, error } = await supabase
     .from("sales")
-    .select(`
-      *,
-      customers ( id, name, phone_display, email, customer_type ),
-      payments ( id, amount, payment_method, transaction_reference, payment_date, status, note, created_at )
-    `)
+    .select("*")
     .eq("id", saleId)
+    .eq("is_demo", false)
     .is("archived_at", null)
     .maybeSingle();
 
   if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch sale", requestId, 500);
   if (!sale) return errorResponse("NOT_FOUND", "Sale not found", requestId, 404);
 
-  // Fetch subscription and renewal if recurring
+  let customer = null;
+  let payments: unknown[] = [];
   let subscription = null;
   let renewal = null;
-  if (sale.purchase_type_snapshot === "recurring") {
+  if (hasPermission(apiKey, "customers:read")) {
+    const result = await supabase.from("customers").select("id,name,phone_display,email,customer_type").eq("id", sale.customer_id).maybeSingle();
+    customer = result.data;
+  }
+  if (hasPermission(apiKey, "payments:read")) {
+    const result = await supabase.from("payments").select("id,amount,payment_method,transaction_reference,payment_date,status,note,created_at").eq("sale_id", saleId).eq("is_demo", false);
+    payments = result.data ?? [];
+  }
+  if (sale.purchase_type_snapshot === "recurring" && hasPermission(apiKey, "subscriptions:read")) {
     const { data: sub } = await supabase
       .from("subscriptions")
       .select("*")
       .eq("current_sale_id", saleId)
       .maybeSingle();
     subscription = sub;
-    if (sub) {
+    if (sub && hasPermission(apiKey, "renewals:read")) {
       const { data: ren } = await supabase
         .from("renewals")
         .select("*")
@@ -229,7 +259,7 @@ async function handleSaleDetail(supabase: ReturnType<typeof createClient>, saleI
     }
   }
 
-  return successResponse({ sale: { ...sale, payments: sale.payments ?? [], subscription, renewal } });
+  return successResponse({ sale: { ...sale, customer, payments, subscription, renewal } });
 }
 
 async function handleSaleCreate(supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
@@ -334,6 +364,15 @@ async function handleCustomersList(supabase: ReturnType<typeof createClient>, re
   const search = url.searchParams.get("search");
   const offset = (page - 1) * limit;
 
+  let matchingIds: string[] | null = null;
+  if (search?.trim()) {
+    const digits = search.replace(/\D/g, "");
+    const { data, error } = await supabase.rpc("search_customer_ids", { p_search: search.trim(), p_phone_digits: digits.length >= 3 ? digits : null });
+    if (error) return errorResponse("INTERNAL_ERROR", "Failed to search customers", requestId, 500);
+    matchingIds = (data ?? []).map((row: { id: string }) => row.id);
+    if (matchingIds.length === 0) return successResponse({ customers: [], pagination: { page, limit, total: 0, has_more: false } });
+  }
+
   let query = supabase
     .from("customers")
     .select("id, name, phone_display, email, customer_type, created_at, updated_at, archived_at", { count: "exact" })
@@ -341,9 +380,7 @@ async function handleCustomersList(supabase: ReturnType<typeof createClient>, re
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (search) {
-    query = query.or(`name.ilike.%${search}%,phone_display.ilike.%${search}%,email.ilike.%${search}%`);
-  }
+  if (matchingIds) query = query.in("id", matchingIds);
 
   const { data, error, count } = await query;
   if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch customers", requestId, 500);
@@ -354,7 +391,7 @@ async function handleCustomersList(supabase: ReturnType<typeof createClient>, re
   });
 }
 
-async function handleCustomerDetail(supabase: ReturnType<typeof createClient>, customerId: string, requestId: string): Promise<Response> {
+async function handleCustomerDetail(supabase: ReturnType<typeof createClient>, customerId: string, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
   const { data, error } = await supabase
     .from("customers")
     .select("*")
@@ -365,14 +402,11 @@ async function handleCustomerDetail(supabase: ReturnType<typeof createClient>, c
   if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch customer", requestId, 500);
   if (!data) return errorResponse("NOT_FOUND", "Customer not found", requestId, 404);
 
-  // Fetch recent sales for this customer
-  const { data: sales } = await supabase
-    .from("sales")
-    .select("id, sale_number, product_name_snapshot, final_selling_price, payment_status, fulfilment_status, sale_date")
-    .eq("customer_id", customerId)
-    .is("archived_at", null)
-    .order("sale_date", { ascending: false })
-    .limit(20);
+  let sales: unknown[] = [];
+  if (hasPermission(apiKey, "sales:read")) {
+    const result = await supabase.from("sales").select("id,sale_number,product_name_snapshot,final_selling_price,payment_status,fulfilment_status,sale_date").eq("customer_id", customerId).eq("is_demo", false).is("archived_at", null).order("sale_date", { ascending: false }).limit(20);
+    sales = result.data ?? [];
+  }
 
   return successResponse({ customer: data, recent_sales: sales ?? [] });
 }
@@ -673,20 +707,20 @@ async function handleCategoryUpdate(supabase: ReturnType<typeof createClient>, c
 }
 
 // --- Renewals ---
-async function handleRenewalsList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+async function handleRenewalsList(supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
   const url = new URL(req.url);
   const page = parseInt(url.searchParams.get("page") || "1");
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
   const status = url.searchParams.get("status");
   const offset = (page - 1) * limit;
 
+  const selection = `id,subscription_id,customer_id,due_date,status,snoozed_until,note,created_at,updated_at
+    ${hasPermission(apiKey, "customers:read") ? ",customers(id,name,phone_display,email)" : ""}
+    ${hasPermission(apiKey, "subscriptions:read") ? ",subscriptions(id,product_plan_id,start_date,end_date,status,next_renewal_date)" : ""}`;
   let query = supabase
     .from("renewals")
-    .select(`
-      id, subscription_id, customer_id, due_date, status, snoozed_until, note, created_at, updated_at,
-      customers ( id, name, phone_display, email ),
-      subscriptions ( id, product_plan_id, start_date, end_date, status, next_renewal_date )
-    `, { count: "exact" })
+    .select(selection, { count: "exact" })
+    .eq("is_demo", false)
     .order("due_date", { ascending: true })
     .range(offset, offset + limit - 1);
 
@@ -712,6 +746,7 @@ async function handleRenewalUpdate(supabase: ReturnType<typeof createClient>, re
     if (!allowedStatuses.includes(body.status)) {
       return errorResponse("VALIDATION_ERROR", "Invalid renewal status", requestId, 422);
     }
+    if (body.status === "renewed") return errorResponse("VALIDATION_ERROR", "Complete a renewal through the renewal-sale workflow", requestId, 422);
     update.status = body.status;
   }
   if (body.snoozed_until !== undefined) update.snoozed_until = body.snoozed_until;
@@ -734,20 +769,19 @@ async function handleRenewalUpdate(supabase: ReturnType<typeof createClient>, re
 }
 
 // --- Subscriptions ---
-async function handleSubscriptionsList(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
+async function handleSubscriptionsList(supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string): Promise<Response> {
   const url = new URL(req.url);
   const page = parseInt(url.searchParams.get("page") || "1");
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
   const status = url.searchParams.get("status");
   const offset = (page - 1) * limit;
 
+  const selection = `id,customer_id,original_sale_id,current_sale_id,product_plan_id,start_date,end_date,status,next_renewal_date,created_at,updated_at
+    ${hasPermission(apiKey, "customers:read") ? ",customers(id,name,phone_display,email)" : ""}`;
   let query = supabase
     .from("subscriptions")
-    .select(`
-      id, customer_id, original_sale_id, current_sale_id, product_plan_id,
-      start_date, end_date, status, next_renewal_date, created_at, updated_at,
-      customers ( id, name, phone_display, email )
-    `, { count: "exact" })
+    .select(selection, { count: "exact" })
+    .eq("is_demo", false)
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
@@ -765,10 +799,14 @@ async function handleSubscriptionsList(supabase: ReturnType<typeof createClient>
 // --- Reports ---
 async function handleReportsSummary(supabase: ReturnType<typeof createClient>, req: Request, requestId: string): Promise<Response> {
   const url = new URL(req.url);
-  const fromDate = url.searchParams.get("from") || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split("T")[0];
-  const toDate = url.searchParams.get("to") || new Date().toISOString().split("T")[0];
-
-  const { data, error } = await supabase.rpc("api_dashboard_stats");
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  const fromDate = url.searchParams.get("from") || `${today.slice(0, 7)}-01`;
+  const toDate = url.searchParams.get("to") || today;
+  const validDate = /^\d{4}-\d{2}-\d{2}$/;
+  if (!validDate.test(fromDate) || !validDate.test(toDate) || fromDate > toDate) return errorResponse("VALIDATION_ERROR", "Use valid from/to dates with from not after to", requestId, 422);
+  const date = new Date(`${toDate}T00:00:00Z`); date.setUTCDate(date.getUTCDate() + 1);
+  const toExclusive = date.toISOString().slice(0, 10);
+  const { data, error } = await supabase.rpc("financial_report_summary", { p_from: fromDate, p_to_exclusive: toExclusive });
   if (error) return errorResponse("INTERNAL_ERROR", "Failed to fetch reports", requestId, 500);
   return successResponse(data);
 }
@@ -781,33 +819,33 @@ interface RouteMatch {
   handler: (supabase: ReturnType<typeof createClient>, req: Request, apiKey: ApiKeyInfo, requestId: string, pathParam?: string) => Promise<Response>;
   pathParam?: string;
   requiresAuth: boolean;
-  requiredPermission?: string;
+  requiredPermission: string | null;
 }
 
 function matchRoute(path: string, method: string): RouteMatch | null {
   // Public routes
   if (path === "/v1/health" && method === "GET") {
-    return { requiresAuth: false, handler: async () => Promise.resolve(handleHealth(generateRequestId())) };
+    return { requiresAuth: false, requiredPermission: null, handler: async () => Promise.resolve(handleHealth(generateRequestId())) };
   }
 
   // Authenticated routes
   if (path === "/v1/whoami" && method === "GET") {
-    return { requiresAuth: true, handler: async (_s, _r, apiKey, requestId) => Promise.resolve(handleWhoami(apiKey, requestId)) };
+    return { requiresAuth: true, requiredPermission: null, handler: async (_s, _r, apiKey, requestId) => Promise.resolve(handleWhoami(apiKey, requestId)) };
   }
   if (path === "/v1/dashboard" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, _r, _a, requestId) => handleDashboard(s, requestId) };
+    return { requiresAuth: true, requiredPermission: "dashboard:read", handler: async (s, _r, _a, requestId) => handleDashboard(s, requestId) };
   }
 
   // Sales
   if (path === "/v1/sales" && method === "GET") {
-    return { requiresAuth: true, requiredPermission: "sales:read", handler: async (s, r, _a, requestId) => handleSalesList(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "sales:read", handler: async (s, r, a, requestId) => handleSalesList(s, r, a, requestId) };
   }
   if (path === "/v1/sales" && method === "POST") {
     return { requiresAuth: true, requiredPermission: "sales:write", handler: async (s, r, a, requestId) => handleSaleCreate(s, r, a, requestId) };
   }
   const saleMatch = path.match(/^\/v1\/sales\/([^/]+)$/);
   if (saleMatch && method === "GET") {
-    return { requiresAuth: true, requiredPermission: "sales:read", pathParam: saleMatch[1], handler: async (s, _r, _a, requestId, id) => handleSaleDetail(s, id!, requestId) };
+    return { requiresAuth: true, requiredPermission: "sales:read", pathParam: saleMatch[1], handler: async (s, _r, a, requestId, id) => handleSaleDetail(s, id!, a, requestId) };
   }
   if (saleMatch && method === "PATCH") {
     return { requiresAuth: true, requiredPermission: "sales:write", pathParam: saleMatch[1], handler: async (s, r, _a, requestId, id) => handleFulfilmentUpdate(s, id!, r, requestId) };
@@ -828,7 +866,7 @@ function matchRoute(path: string, method: string): RouteMatch | null {
   }
   const customerMatch = path.match(/^\/v1\/customers\/([^/]+)$/);
   if (customerMatch && method === "GET") {
-    return { requiresAuth: true, requiredPermission: "customers:read", pathParam: customerMatch[1], handler: async (s, _r, _a, requestId, id) => handleCustomerDetail(s, id!, requestId) };
+    return { requiresAuth: true, requiredPermission: "customers:read", pathParam: customerMatch[1], handler: async (s, _r, a, requestId, id) => handleCustomerDetail(s, id!, a, requestId) };
   }
   if (customerMatch && method === "PATCH") {
     return { requiresAuth: true, requiredPermission: "customers:write", pathParam: customerMatch[1], handler: async (s, r, _a, requestId, id) => handleCustomerUpdate(s, id!, r, requestId) };
@@ -843,47 +881,47 @@ function matchRoute(path: string, method: string): RouteMatch | null {
   }
   const productMatch = path.match(/^\/v1\/products\/([^/]+)$/);
   if (productMatch && method === "PATCH") {
-    return { requiresAuth: true, pathParam: productMatch[1], handler: async (s, r, _a, requestId, id) => handleProductUpdate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "products:write", pathParam: productMatch[1], handler: async (s, r, _a, requestId, id) => handleProductUpdate(s, id!, r, requestId) };
   }
 
   // Product Plans
   if (path === "/v1/product-plans" && method === "POST") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleProductPlanCreate(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "products:write", handler: async (s, r, _a, requestId) => handleProductPlanCreate(s, r, requestId) };
   }
   const planMatch = path.match(/^\/v1\/product-plans\/([^/]+)$/);
   if (planMatch && method === "PATCH") {
-    return { requiresAuth: true, pathParam: planMatch[1], handler: async (s, r, _a, requestId, id) => handleProductPlanUpdate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "products:write", pathParam: planMatch[1], handler: async (s, r, _a, requestId, id) => handleProductPlanUpdate(s, id!, r, requestId) };
   }
 
   // Categories
   if (path === "/v1/categories" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, _r, _a, requestId) => handleCategoriesList(s, requestId) };
+    return { requiresAuth: true, requiredPermission: "categories:read", handler: async (s, _r, _a, requestId) => handleCategoriesList(s, requestId) };
   }
   if (path === "/v1/categories" && method === "POST") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleCategoryCreate(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "categories:write", handler: async (s, r, _a, requestId) => handleCategoryCreate(s, r, requestId) };
   }
   const categoryMatch = path.match(/^\/v1\/categories\/([^/]+)$/);
   if (categoryMatch && method === "PATCH") {
-    return { requiresAuth: true, pathParam: categoryMatch[1], handler: async (s, r, _a, requestId, id) => handleCategoryUpdate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "categories:write", pathParam: categoryMatch[1], handler: async (s, r, _a, requestId, id) => handleCategoryUpdate(s, id!, r, requestId) };
   }
 
   // Renewals
   if (path === "/v1/renewals" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleRenewalsList(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "renewals:read", handler: async (s, r, a, requestId) => handleRenewalsList(s, r, a, requestId) };
   }
   const renewalMatch = path.match(/^\/v1\/renewals\/([^/]+)$/);
   if (renewalMatch && method === "PATCH") {
-    return { requiresAuth: true, pathParam: renewalMatch[1], handler: async (s, r, _a, requestId, id) => handleRenewalUpdate(s, id!, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "renewals:write", pathParam: renewalMatch[1], handler: async (s, r, _a, requestId, id) => handleRenewalUpdate(s, id!, r, requestId) };
   }
 
   // Subscriptions
   if (path === "/v1/subscriptions" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleSubscriptionsList(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "subscriptions:read", handler: async (s, r, a, requestId) => handleSubscriptionsList(s, r, a, requestId) };
   }
 
   // Reports
   if (path === "/v1/reports/summary" && method === "GET") {
-    return { requiresAuth: true, handler: async (s, r, _a, requestId) => handleReportsSummary(s, r, requestId) };
+    return { requiresAuth: true, requiredPermission: "reports:read", handler: async (s, r, _a, requestId) => handleReportsSummary(s, r, requestId) };
   }
 
   return null;
