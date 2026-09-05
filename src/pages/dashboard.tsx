@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth";
-import { PageContainer, PageHeader, EmptyState, StatusBadge } from "@/components/ui-shared";
+import { PageContainer, PageHeader, EmptyState, RetryableError, StatusBadge } from "@/components/ui-shared";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -47,6 +47,7 @@ import {
 } from "recharts";
 import { formatMoney } from "@/lib/format";
 import type { OwnerDashboardStats, ManagerDashboardStats, Sale, Customer } from "@/lib/types";
+import { DASHBOARD_FINANCIAL_FIELDS, type DashboardFinancialStats, requireSingleRpcRow } from "@/lib/data-safety";
 
 interface MonthlyTrend {
   month: string;
@@ -493,25 +494,12 @@ export function DashboardPage() {
   const navigate = useNavigate();
   const [chartMonths, setChartMonths] = useState("6");
 
-  const { data: finStats, isLoading: finLoading } = useQuery({
+  const { data: finStats, isLoading: finLoading, isError: finError, refetch: retryFinStats } = useQuery({
     queryKey: ["dashboard-financial-stats"],
     queryFn: async () => {
       const { data, error } = await supabase.rpc("dashboard_financial_stats");
       if (error) throw error;
-      return data as {
-        revenue_this_month: number;
-        cash_received_this_month: number;
-        expenses_this_month: number;
-        gross_profit_this_month: number;
-        net_profit_this_month: number;
-        pending_payments_count: number;
-        activations_pending_count: number;
-        upcoming_renewals_count: number;
-        overdue_renewals_count: number;
-        renewals_due_today_count: number;
-        prev_month_revenue: number;
-        prev_month_profit: number;
-      };
+      return requireSingleRpcRow<DashboardFinancialStats>(data, "Dashboard summary", DASHBOARD_FINANCIAL_FIELDS);
     },
   });
 
@@ -541,6 +529,7 @@ export function DashboardPage() {
       const { data, error } = await supabase
         .from("sales")
         .select("*, customer:customers(*), created_by_profile:profiles!sales_created_by_fkey(*)")
+        .eq("is_demo", false)
         .order("created_at", { ascending: false })
         .limit(8);
       if (error) throw error;
@@ -578,41 +567,42 @@ export function DashboardPage() {
 
         {isOwner ? (
           <>
+            {finError && <RetryableError message="Financial summary could not be loaded. Values are hidden to avoid showing misleading zeroes." onRetry={() => void retryFinStats()} />}
             {/* Key stats with trends */}
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <StatCard
                 label="Revenue"
-                value={formatMoney(finStats?.revenue_this_month ?? 0)}
+                value={finStats ? formatMoney(finStats.revenue_this_month) : "—"}
                 icon={<IndianRupee className="h-5 w-5" />}
                 tone="primary"
                 loading={finLoading}
-                trend={<TrendIndicator current={finStats?.revenue_this_month ?? 0} previous={finStats?.prev_month_revenue ?? 0} />}
+                trend={finStats ? <TrendIndicator current={finStats.revenue_this_month} previous={finStats.prev_month_revenue} /> : undefined}
               />
               <StatCard
                 label="Cash Received"
-                value={formatMoney(finStats?.cash_received_this_month ?? 0)}
+                value={finStats ? formatMoney(finStats.cash_received_this_month) : "—"}
                 icon={<CheckCircle2 className="h-5 w-5" />}
                 tone="success"
                 loading={finLoading}
               />
               <StatCard
                 label="Expenses"
-                value={formatMoney(finStats?.expenses_this_month ?? 0)}
+                value={finStats ? formatMoney(finStats.expenses_this_month) : "—"}
                 icon={<Package className="h-5 w-5" />}
                 tone="info"
                 loading={finLoading}
               />
               <StatCard
                 label="Gross Profit"
-                value={formatMoney(finStats?.gross_profit_this_month ?? 0)}
+                value={finStats ? formatMoney(finStats.gross_profit_this_month) : "—"}
                 icon={<TrendingUp className="h-5 w-5" />}
                 tone="success"
                 loading={finLoading}
-                trend={<TrendIndicator current={finStats?.gross_profit_this_month ?? 0} previous={finStats?.prev_month_profit ?? 0} />}
+                trend={finStats ? <TrendIndicator current={finStats.gross_profit_this_month} previous={finStats.prev_month_profit} /> : undefined}
               />
               <StatCard
                 label="Net Profit"
-                value={formatMoney(finStats?.net_profit_this_month ?? 0)}
+                value={finStats ? formatMoney(finStats.net_profit_this_month) : "—"}
                 icon={<TrendingUp className="h-5 w-5" />}
                 tone={finStats && finStats.net_profit_this_month >= 0 ? "success" : "danger"}
                 loading={finLoading}
@@ -627,10 +617,10 @@ export function DashboardPage() {
 
             {/* Operational stats row */}
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <StatCard label="Pending Payments" value={String(finStats?.pending_payments_count ?? 0)} icon={<Clock className="h-5 w-5" />} tone="warning" loading={finLoading} />
-              <StatCard label="Activations Pending" value={String(finStats?.activations_pending_count ?? 0)} icon={<Clock className="h-5 w-5" />} tone="warning" loading={finLoading} />
-              <StatCard label="Renewals Due Today" value={String(finStats?.renewals_due_today_count ?? 0)} icon={<CalendarClock className="h-5 w-5" />} tone="warning" loading={finLoading} />
-              <StatCard label="Overdue Renewals" value={String(finStats?.overdue_renewals_count ?? 0)} icon={<AlertTriangle className="h-5 w-5" />} tone="danger" loading={finLoading} />
+              <StatCard label="Pending Payments (this month)" value={finStats ? String(finStats.pending_payments_count) : "—"} icon={<Clock className="h-5 w-5" />} tone="warning" loading={finLoading} />
+              <StatCard label="Activations Pending (this month)" value={finStats ? String(finStats.activations_pending_count) : "—"} icon={<Clock className="h-5 w-5" />} tone="warning" loading={finLoading} />
+              <StatCard label="Renewals Due Today" value={finStats ? String(finStats.renewals_due_today_count) : "—"} icon={<CalendarClock className="h-5 w-5" />} tone="warning" loading={finLoading} />
+              <StatCard label="Overdue Renewals" value={finStats ? String(finStats.overdue_renewals_count) : "—"} icon={<AlertTriangle className="h-5 w-5" />} tone="danger" loading={finLoading} />
             </div>
 
             {/* Revenue chart with range selector */}

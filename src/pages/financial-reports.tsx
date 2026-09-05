@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
-import { PageContainer, PageHeader } from "@/components/ui-shared";
+import { PageContainer, PageHeader, RetryableError } from "@/components/ui-shared";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -22,7 +22,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { formatMoney } from "@/lib/format";
-import type { Sale, Payment } from "@/lib/types";
+import { addDateDays, currentIstDate, dateRangeStart, requireRpcObject } from "@/lib/data-safety";
 
 type RangeKey = "7d" | "30d" | "90d" | "ytd" | "all";
 
@@ -34,148 +34,73 @@ const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: "all", label: "All time" },
 ];
 
-function getStartDate(range: RangeKey): string | null {
-  if (range === "all") return null;
-  const now = new Date();
-  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  if (range === "7d") d.setDate(d.getDate() - 7);
-  else if (range === "30d") d.setDate(d.getDate() - 30);
-  else if (range === "90d") d.setDate(d.getDate() - 90);
-  else if (range === "ytd") {
-    d.setMonth(0);
-    d.setDate(1);
-  }
-  return d.toISOString().slice(0, 10);
+interface ReportStats {
+  totalSales: number; revenue: number; productCost: number; paymentFees: number;
+  refunds: number; replacementCosts: number; paymentsReceived: number;
+  outstandingAmount: number; outstandingCount: number; grossProfit: number;
+  expenses: number; netProfit: number; undatedLegacyRefunds: number;
+  topProducts: { name: string; count: number; revenue: number }[];
 }
 
-type SaleWithCustomer = Sale & { customer: { name: string | null; phone_display: string | null } | null };
+const REPORT_NUMERIC_FIELDS = ["totalSales","revenue","productCost","paymentFees","refunds","replacementCosts","paymentsReceived","outstandingAmount","outstandingCount","grossProfit","expenses","netProfit","undatedLegacyRefunds"] as const;
 
 export function FinancialReportsPage() {
   const [range, setRange] = useState<RangeKey>("30d");
 
-  const startDate = getStartDate(range);
+  const startDate = dateRangeStart(range);
+  const toExclusive = range === "all" ? null : addDateDays(currentIstDate(), 1);
 
-  const { data: stats, isLoading } = useQuery({
+  const { data: stats, isLoading, isError, refetch } = useQuery({
     queryKey: ["financial-reports", range],
     queryFn: async () => {
-      let saleQuery = supabase
-        .from("sales")
-        .select("*, customer:customers(name, phone_display)")
-        .order("sale_date", { ascending: false });
-
-      if (startDate) saleQuery = saleQuery.gte("sale_date", startDate);
-
-      const { data: sales, error: saleError } = await saleQuery;
-      if (saleError) throw saleError;
-
-      const salesData = (sales ?? []) as SaleWithCustomer[];
-      const saleIds = salesData.map((s) => s.id);
-
-      let paymentsData: Payment[] = [];
-      if (saleIds.length > 0) {
-        let payQuery = supabase
-          .from("payments")
-          .select("*")
-          .in("sale_id", saleIds)
-          .eq("status", "valid");
-
-        if (startDate) payQuery = payQuery.gte("payment_date", startDate);
-
-        const { data: payments, error: payError } = await payQuery;
-        if (payError) throw payError;
-        paymentsData = (payments ?? []) as Payment[];
-      }
-
-      const nonCancelledSales = salesData.filter((s) => s.payment_status !== "cancelled");
-      const totalSales = nonCancelledSales.length;
-      const revenue = nonCancelledSales.reduce((sum, s) => sum + s.final_selling_price, 0);
-      const productCost = nonCancelledSales.reduce((sum, s) => sum + s.cost_price_snapshot, 0);
-      const paymentFees = nonCancelledSales.reduce((sum, s) => sum + s.payment_fee, 0);
-      const refunds = nonCancelledSales.reduce((sum, s) => sum + s.refund_amount, 0);
-      const replacementCosts = nonCancelledSales.reduce((sum, s) => sum + s.replacement_cost, 0);
-      const paymentsReceived = paymentsData.reduce((sum, p) => sum + p.amount, 0);
-
-      const outstandingSales = nonCancelledSales.filter(
-        (s) => s.payment_status === "pending" || s.payment_status === "partial",
-      );
-      const outstandingAmount = outstandingSales.reduce((sum, s) => {
-        const paidForSale = paymentsData
-          .filter((p) => p.sale_id === s.id)
-          .reduce((sum, p) => sum + p.amount, 0);
-        return sum + Math.max(0, s.final_selling_price - paidForSale);
-      }, 0);
-
-      const grossProfit = revenue - productCost - paymentFees - refunds - replacementCosts;
-
-      const topProducts = new Map<string, { count: number; revenue: number }>();
-      for (const s of nonCancelledSales) {
-        const key = `${s.product_name_snapshot} · ${s.plan_name_snapshot}`;
-        const existing = topProducts.get(key) ?? { count: 0, revenue: 0 };
-        existing.count += 1;
-        existing.revenue += s.final_selling_price;
-        topProducts.set(key, existing);
-      }
-      const topProductsList = Array.from(topProducts.entries())
-        .map(([name, data]) => ({ name, ...data }))
-        .sort((a, b) => b.revenue - a.revenue)
-        .slice(0, 5);
-
-      return {
-        totalSales,
-        revenue,
-        productCost,
-        paymentFees,
-        refunds,
-        replacementCosts,
-        paymentsReceived,
-        outstandingAmount,
-        outstandingCount: outstandingSales.length,
-        grossProfit,
-        topProducts: topProductsList,
-      };
+      const { data, error } = await supabase.rpc("financial_report_summary", { p_from: startDate, p_to_exclusive: toExclusive });
+      if (error) throw error;
+      const result = requireRpcObject<ReportStats>(data, "Financial report", REPORT_NUMERIC_FIELDS);
+      if (!Array.isArray(result.topProducts)) throw new Error("Financial report returned an unexpected response. Please retry.");
+      return result;
     },
   });
 
   const cards = [
     {
       label: "Total Sales",
-      value: String(stats?.totalSales ?? 0),
+      value: stats ? String(stats.totalSales) : "—",
       icon: <ShoppingCart className="h-5 w-5" />,
       tone: "text-primary bg-primary/10",
     },
     {
       label: "Revenue",
-      value: formatMoney(stats?.revenue ?? 0),
+      value: stats ? formatMoney(stats.revenue) : "—",
       icon: <IndianRupee className="h-5 w-5" />,
       tone: "text-primary bg-primary/10",
     },
     {
       label: "Payments Received",
-      value: formatMoney(stats?.paymentsReceived ?? 0),
+      value: stats ? formatMoney(stats.paymentsReceived) : "—",
       icon: <CheckCircle2 className="h-5 w-5" />,
       tone: "text-success bg-success/10",
     },
     {
       label: "Outstanding",
-      value: formatMoney(stats?.outstandingAmount ?? 0),
+      value: stats ? formatMoney(stats.outstandingAmount) : "—",
       icon: <Clock className="h-5 w-5" />,
       tone: "text-warning bg-warning/10",
     },
     {
       label: "Refunds",
-      value: formatMoney(stats?.refunds ?? 0),
+      value: stats ? formatMoney(stats.refunds) : "—",
       icon: <RotateCcw className="h-5 w-5" />,
       tone: "text-destructive bg-destructive/10",
     },
     {
       label: "Product Cost",
-      value: formatMoney(stats?.productCost ?? 0),
+      value: stats ? formatMoney(stats.productCost) : "—",
       icon: <Package className="h-5 w-5" />,
       tone: "text-info bg-info/10",
     },
     {
       label: "Gross Profit",
-      value: formatMoney(stats?.grossProfit ?? 0),
+      value: stats ? formatMoney(stats.grossProfit) : "—",
       icon: <TrendingUp className="h-5 w-5" />,
       tone: "text-success bg-success/10",
     },
@@ -202,6 +127,14 @@ export function FinancialReportsPage() {
             </Select>
           }
         />
+
+        {isError && <RetryableError message="Financial report could not be loaded. Values are hidden until the request succeeds." onRetry={() => void refetch()} />}
+
+        {stats && stats.undatedLegacyRefunds > 0 && (
+          <p className="rounded-lg border border-warning/30 bg-warning/5 px-4 py-3 text-sm text-warning">
+            {formatMoney(stats.undatedLegacyRefunds)} of legacy refunds have no historical event date and are excluded from date-range refund totals.
+          </p>
+        )}
 
         {/* Stat cards */}
         {isLoading ? (

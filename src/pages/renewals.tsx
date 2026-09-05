@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { PageContainer, PageHeader, EmptyState, StatusBadge } from "@/components/ui-shared";
 import { Card, CardContent } from "@/components/ui/card";
@@ -31,8 +32,10 @@ import {
   XCircle,
   Trash2,
 } from "lucide-react";
-import { formatDate, normalizePhone } from "@/lib/format";
+import { formatDate } from "@/lib/format";
 import type { Renewal, Customer, Subscription, ProductPlan, Product } from "@/lib/types";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
+import { currentIstDate } from "@/lib/data-safety";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -64,10 +67,7 @@ type FilterTab = "all" | "overdue" | "today" | "next7" | "next30" | "future";
 
 function daysOverdue(dueDate: string): number {
   const due = new Date(dueDate + "T00:00:00Z");
-  const now = new Date();
-  const today = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-  );
+  const today = new Date(currentIstDate() + "T00:00:00Z");
   return Math.floor((today.getTime() - due.getTime()) / (1000 * 60 * 60 * 24));
 }
 
@@ -95,41 +95,42 @@ function buildWhatsAppUrl(
 
 export function RenewalsPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<FilterTab>("all");
+  const debouncedSearch = useDebouncedValue(search);
+  const requestedFilter = searchParams.get("filter") as FilterTab | null;
+  const [filter, setFilter] = useState<FilterTab>(requestedFilter && ["all","overdue","today","next7","next30","future"].includes(requestedFilter) ? requestedFilter : "all");
   const [snoozeTarget, setSnoozeTarget] = useState<RenewalWithRelations | null>(null);
   const [snoozeDays, setSnoozeDays] = useState("7");
   const [notRenewingTarget, setNotRenewingTarget] = useState<RenewalWithRelations | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<RenewalWithRelations | null>(null);
 
   const { data: renewals, isLoading } = useQuery({
-    queryKey: ["renewals", search],
+    queryKey: ["renewals", debouncedSearch],
     queryFn: async () => {
+      let customerIds: string[] | null = null;
+      if (debouncedSearch.trim()) {
+        const { data: matches, error: searchError } = await supabase.rpc("search_customer_ids", { p_search: debouncedSearch.trim() });
+        if (searchError) throw searchError;
+        customerIds = Array.isArray(matches) ? matches.map(row => typeof row === "string" ? row : (row as { id?: string }).id).filter((id): id is string => Boolean(id)) : [];
+      }
       let q = supabase
         .from("renewals")
         .select(
           "*, customer:customers(*), subscription:subscriptions(*, product_plan:product_plans(*, product:products(*)))",
         )
         .in("status", PENDING_STATUSES)
+        .eq("is_demo", false)
+        .or(`status.neq.snoozed,snoozed_until.is.null,snoozed_until.lte.${currentIstDate()}`)
         .order("due_date", { ascending: true })
         .limit(200);
 
+      if (customerIds) q = q.in("customer_id", customerIds.length ? customerIds : ["00000000-0000-0000-0000-000000000000"]);
+
       const { data, error } = await q;
       if (error) throw error;
-      let result = data as RenewalWithRelations[];
-
-      if (search.trim()) {
-        const norm = normalizePhone(search);
-        const lower = search.toLowerCase();
-        result = result.filter(
-          (r) =>
-            (r.customer?.name?.toLowerCase().includes(lower) ?? false) ||
-            (r.customer?.phone_normalized.includes(norm) ?? false) ||
-            (r.customer?.phone_display?.toLowerCase().includes(lower) ?? false),
-        );
-      }
-
-      return result;
+      return data as RenewalWithRelations[];
     },
   });
 
@@ -153,7 +154,7 @@ export function RenewalsPage() {
     return true;
   });
 
-  const remindMutation = useMutation({
+  const confirmContactMutation = useMutation({
     mutationFn: async (renewalId: string) => {
       const { error } = await supabase
         .from("renewals")
@@ -167,24 +168,6 @@ export function RenewalsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["renewals"] });
       toast.success("Marked as reminded");
-    },
-    onError: (err: Error) => toast.error(err.message),
-  });
-
-  const renewedMutation = useMutation({
-    mutationFn: async (renewalId: string) => {
-      const { error } = await supabase
-        .from("renewals")
-        .update({
-          status: "renewed",
-          renewed_at: new Date().toISOString(),
-        })
-        .eq("id", renewalId);
-      if (error) throw error;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["renewals"] });
-      toast.success("Marked as renewed");
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -241,6 +224,10 @@ export function RenewalsPage() {
   });
 
   const handleRemind = (renewal: RenewalWithRelations) => {
+    if (renewal.customer?.do_not_message) {
+      toast.error("This customer has opted out of messages");
+      return;
+    }
     const phone = renewal.customer?.phone_normalized ?? "";
     const countryCode = renewal.customer?.phone_country_code ?? "91";
     const customerName = renewal.customer?.name ?? null;
@@ -262,7 +249,10 @@ export function RenewalsPage() {
       renewal.due_date,
     );
     window.open(url, "_blank");
-    remindMutation.mutate(renewal.id);
+    void supabase.from("renewals").update({ reminder_opened_at: new Date().toISOString() }).eq("id", renewal.id).then(({ error }) => {
+      if (error) toast.error("WhatsApp opened, but the chat-open timestamp could not be saved");
+      else queryClient.invalidateQueries({ queryKey: ["renewals"] });
+    });
   };
 
   const tabs: { key: FilterTab; label: string; count: number }[] = [
@@ -279,7 +269,7 @@ export function RenewalsPage() {
       <div className="flex flex-col gap-6">
         <PageHeader
           title="Renewals"
-          description="All pending renewals — send a WhatsApp reminder with one click"
+          description="Pending follow-ups — opening WhatsApp and confirming contact are tracked separately"
         />
 
         {/* Search */}
@@ -443,23 +433,21 @@ export function RenewalsPage() {
                                 variant="outline"
                                 className="gap-1.5"
                                 onClick={() => handleRemind(r)}
-                                disabled={
-                                  remindMutation.isPending &&
-                                  remindMutation.variables === r.id
-                                }
+                                disabled={Boolean(r.customer?.do_not_message)}
                               >
                                 <RefreshCw className="h-3.5 w-3.5" />
                                 Remind
                               </Button>
+                              {r.reminder_opened_at && !r.reminded_at && (
+                                <Button size="sm" variant="outline" onClick={() => confirmContactMutation.mutate(r.id)} disabled={confirmContactMutation.isPending}>
+                                  Confirm Contact
+                                </Button>
+                              )}
                               <Button
                                 size="sm"
                                 variant="outline"
                                 className="gap-1.5 border-success/30 text-success hover:bg-success/10"
-                                onClick={() => renewedMutation.mutate(r.id)}
-                                disabled={
-                                  renewedMutation.isPending &&
-                                  renewedMutation.variables === r.id
-                                }
+                                onClick={() => navigate(`/sales/new?renewal=${r.id}`)}
                               >
                                 <CheckCircle2 className="h-3.5 w-3.5" />
                                 Renewed
@@ -543,23 +531,21 @@ export function RenewalsPage() {
                           variant="outline"
                           className="gap-1.5"
                           onClick={() => handleRemind(r)}
-                          disabled={
-                            remindMutation.isPending &&
-                            remindMutation.variables === r.id
-                          }
+                          disabled={Boolean(r.customer?.do_not_message)}
                         >
                           <RefreshCw className="h-3.5 w-3.5" />
                           Remind
                         </Button>
+                        {r.reminder_opened_at && !r.reminded_at && (
+                          <Button size="sm" variant="outline" onClick={() => confirmContactMutation.mutate(r.id)} disabled={confirmContactMutation.isPending}>
+                            Confirm Contact
+                          </Button>
+                        )}
                         <Button
                           size="sm"
                           variant="outline"
                           className="gap-1.5 border-success/30 text-success hover:bg-success/10"
-                          onClick={() => renewedMutation.mutate(r.id)}
-                          disabled={
-                            renewedMutation.isPending &&
-                            renewedMutation.variables === r.id
-                          }
+                          onClick={() => navigate(`/sales/new?renewal=${r.id}`)}
                         >
                           <CheckCircle2 className="h-3.5 w-3.5" />
                           Renewed

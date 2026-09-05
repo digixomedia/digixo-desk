@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
@@ -23,12 +23,15 @@ import { UserCheck, Package, CreditCard, Check, Search, Calendar, Zap } from "lu
 import { normalizePhone, formatMoney, formatDate } from "@/lib/format";
 import { getSettings } from "@/pages/settings";
 import type { Customer, Product, ProductPlan, FulfilmentStatus, PurchaseType } from "@/lib/types";
+import { addDateDays, currentIstDate } from "@/lib/data-safety";
 
 export function NewSalePage() {
   const { isOwner } = useAuth();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const renewalId = searchParams.get("renewal");
+  const renewalIdempotencyKey = useRef(crypto.randomUUID());
 
   const [step, setStep] = useState(1);
 
@@ -70,16 +73,40 @@ export function NewSalePage() {
   const [paymentMethod, setPaymentMethod] = useState("");
   const [txnRef, setTxnRef] = useState("");
   const [fulfilmentStatus, setFulfilmentStatus] = useState<FulfilmentStatus>("payment_confirmation");
-  const [saleDate, setSaleDate] = useState(new Date().toISOString().slice(0, 10));
+  const [saleDate, setSaleDate] = useState(currentIstDate());
   const [subStartDate, setSubStartDate] = useState(saleDate);
   const [renewalDate, setRenewalDate] = useState("");
   const [warrantyEndDate, setWarrantyEndDate] = useState("");
   const [note, setNote] = useState("");
 
+  const { data: renewalContext, isLoading: renewalLoading } = useQuery({
+    queryKey: ["renewal-sale-context", renewalId],
+    queryFn: async () => {
+      const { data, error } = await supabase.from("renewals").select("*, customer:customers(*), subscription:subscriptions(*, product_plan:product_plans(*))").eq("id", renewalId!).maybeSingle();
+      if (error) throw error;
+      if (!data?.customer || !data.subscription?.product_plan) throw new Error("Renewal context is incomplete");
+      return data as { customer: Customer; due_date: string; subscription: { id: string; end_date: string | null; product_plan: ProductPlan } };
+    },
+    enabled: Boolean(renewalId),
+  });
+
+  useEffect(() => {
+    if (!renewalContext) return;
+    const plan = renewalContext.subscription.product_plan;
+    const start = renewalContext.subscription.end_date && renewalContext.subscription.end_date >= currentIstDate()
+      ? renewalContext.subscription.end_date : currentIstDate();
+    setExistingCustomer(renewalContext.customer); setUseExisting(true); setPhoneSearched(true);
+    setPhoneSearch(renewalContext.customer.phone_display ?? renewalContext.customer.phone_normalized);
+    setSelectedProductId(plan.product_id); setSelectedPlanId(plan.id); setIsCustom(false);
+    setCostPrice(String(plan.default_cost_price)); setSellingPrice(String(plan.default_selling_price));
+    setListPrice(plan.optional_list_price?.toString() ?? ""); setSubStartDate(start);
+    setRenewalDate(plan.duration_days ? addDateDays(start, plan.duration_days) : ""); setStep(2);
+  }, [renewalContext]);
+
   // Pre-fill customer from URL
   useEffect(() => {
     const customerId = searchParams.get("customer");
-    if (customerId) {
+    if (customerId && !renewalId) {
       supabase
         .from("customers")
         .select("*")
@@ -95,7 +122,7 @@ export function NewSalePage() {
           }
         });
     }
-  }, [searchParams]);
+  }, [searchParams, renewalId]);
 
   // Auto-detect existing customer as phone is typed (debounced)
   useEffect(() => {
@@ -161,7 +188,7 @@ export function NewSalePage() {
 
   // Auto-fill prices when plan selected
   useEffect(() => {
-    if (selectedPlan) {
+    if (selectedPlan && !renewalId) {
       setCostPrice(selectedPlan.default_cost_price.toString());
       setSellingPrice(selectedPlan.default_selling_price.toString());
       setListPrice(selectedPlan.optional_list_price?.toString() ?? "");
@@ -178,7 +205,7 @@ export function NewSalePage() {
         setWarrantyEndDate(wd.toISOString().slice(0, 10));
       }
     }
-  }, [selectedPlanId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedPlanId, renewalId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: recentSales } = useQuery({
     queryKey: ["customer-recent-sales", existingCustomer?.id],
@@ -238,7 +265,9 @@ export function NewSalePage() {
       }
       if (warrantyEndDate) payload.warranty_end_date = warrantyEndDate;
 
-      const { data, error } = await supabase.rpc("create_sale", { p_payload: payload });
+      const { data, error } = renewalId
+        ? await supabase.rpc("complete_renewal", { p_renewal_id: renewalId, p_payload: payload, p_idempotency_key: renewalIdempotencyKey.current })
+        : await supabase.rpc("create_sale", { p_payload: payload });
       if (error) throw error;
       return { data, redirectAction };
     },
@@ -246,7 +275,12 @@ export function NewSalePage() {
       queryClient.invalidateQueries({ queryKey: ["dashboard"] });
       queryClient.invalidateQueries({ queryKey: ["sales"] });
       queryClient.invalidateQueries({ queryKey: ["customers"] });
-      toast.success(`Sale ${data.sale_number} created`);
+      queryClient.invalidateQueries({ queryKey: ["renewals"] });
+      queryClient.invalidateQueries({ queryKey: ["customer-renewals"] });
+      queryClient.invalidateQueries({ queryKey: ["customer-subscriptions"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard-financial-stats"] });
+      queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
+      toast.success(`${renewalId ? "Renewal sale" : "Sale"} ${data.sale_number} created`);
 
       if (redirectAction === "view" && data.customer_id) {
         navigate(`/customers/${data.customer_id}`);
@@ -308,7 +342,9 @@ export function NewSalePage() {
   return (
     <PageContainer>
       <div className="flex flex-col gap-6">
-        <PageHeader title="New Sale" description="Create a sale in a few quick steps" />
+        <PageHeader title={renewalId ? "Renew Subscription" : "New Sale"} description={renewalId ? "Review the renewal sale, payment and subscription dates before saving" : "Create a sale in a few quick steps"} />
+
+        {renewalId && renewalLoading && <Skeleton className="h-16" />}
 
         {/* Step indicator */}
         <div className="flex items-center gap-2 overflow-x-auto pb-1">
@@ -436,7 +472,7 @@ export function NewSalePage() {
                 <CardHeader><CardTitle className="flex items-center gap-2 text-base"><Package className="h-4 w-4" /> Product & Prices</CardTitle></CardHeader>
                 <CardContent className="flex flex-col gap-4">
                   <div className="flex items-center gap-2">
-                    <Switch id="custom-product" checked={isCustom} onCheckedChange={setIsCustom} />
+                    <Switch id="custom-product" checked={isCustom} onCheckedChange={setIsCustom} disabled={Boolean(renewalId)} />
                     <Label htmlFor="custom-product">Custom / Unlisted Product</Label>
                   </div>
 
@@ -479,7 +515,7 @@ export function NewSalePage() {
                         <>
                           <div className="flex flex-col gap-1.5">
                             <Label htmlFor="product-select">Product</Label>
-                            <Select value={selectedProductId} onValueChange={(v) => { setSelectedProductId(v); setSelectedPlanId(""); }}>
+                            <Select value={selectedProductId} onValueChange={(v) => { setSelectedProductId(v); setSelectedPlanId(""); }} disabled={Boolean(renewalId)}>
                               <SelectTrigger id="product-select"><SelectValue placeholder="Select product" /></SelectTrigger>
                               <SelectContent>
                                 {products.map((p) => (
@@ -497,7 +533,7 @@ export function NewSalePage() {
                               ) : plans.length === 0 ? (
                                 <p className="text-sm text-muted-foreground">No plans for this product.</p>
                               ) : (
-                                <Select value={selectedPlanId} onValueChange={setSelectedPlanId}>
+                                <Select value={selectedPlanId} onValueChange={setSelectedPlanId} disabled={Boolean(renewalId)}>
                                   <SelectTrigger id="plan-select"><SelectValue placeholder="Select plan" /></SelectTrigger>
                                   <SelectContent>
                                     {plans.map((p) => (
@@ -549,7 +585,7 @@ export function NewSalePage() {
                   )}
 
                   <div className="flex justify-between">
-                    <Button variant="outline" onClick={() => setStep(1)}>Back</Button>
+                    <Button variant="outline" onClick={() => setStep(1)} disabled={Boolean(renewalId)}>Back</Button>
                     <Button onClick={() => setStep(3)} disabled={!canProceed()}>Next</Button>
                   </div>
                 </CardContent>
@@ -635,7 +671,7 @@ export function NewSalePage() {
                           <Input id="warranty-end" type="date" value={warrantyEndDate} onChange={(e) => setWarrantyEndDate(e.target.value)} />
                         </div>
                       </div>
-                      <p className="mt-2 text-xs text-muted-foreground">A subscription record and the first renewal entry will be created automatically.</p>
+                      <p className="mt-2 text-xs text-muted-foreground">{renewalId ? "Early renewals normally continue from the existing expiry; expired subscriptions start today. Review both dates before saving. The existing subscription will be extended." : "A subscription record and the first renewal entry will be created automatically."}</p>
                     </div>
                   )}
 
@@ -709,9 +745,7 @@ export function NewSalePage() {
                     <Button variant="outline" onClick={() => createSaleMutation.mutate("list")} disabled={createSaleMutation.isPending}>
                       Save Sale
                     </Button>
-                    <Button variant="outline" onClick={() => createSaleMutation.mutate("another")} disabled={createSaleMutation.isPending}>
-                      Save & Add Another
-                    </Button>
+                    {!renewalId && <Button variant="outline" onClick={() => createSaleMutation.mutate("another")} disabled={createSaleMutation.isPending}>Save & Add Another</Button>}
                     <Button onClick={() => createSaleMutation.mutate("view")} disabled={createSaleMutation.isPending}>
                       {createSaleMutation.isPending ? "Saving…" : "Save & View Customer"}
                     </Button>

@@ -27,6 +27,7 @@ import {
 import { toast } from "sonner";
 import { Plus, Users, Search, Archive, ArchiveRestore, Trash2, EyeOff } from "lucide-react";
 import { normalizePhone, formatDate } from "@/lib/format";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import type { Customer, CustomerType, AcquisitionSource, Profile } from "@/lib/types";
 import {
   AlertDialog,
@@ -45,6 +46,7 @@ export function CustomersPage() {
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState(searchParams.get("q") ?? "");
+  const debouncedSearch = useDebouncedValue(search);
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [createOpen, setCreateOpen] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
@@ -69,7 +71,7 @@ export function CustomersPage() {
   });
 
   const { data: customers, isLoading } = useQuery({
-    queryKey: ["customers", search, typeFilter, showArchived],
+    queryKey: ["customers", debouncedSearch, typeFilter, showArchived],
     queryFn: async () => {
       let q = supabase
         .from("customers")
@@ -86,23 +88,16 @@ export function CustomersPage() {
         q = q.eq("customer_type", typeFilter);
       }
 
-      const { data, error } = await q;
-      if (error) throw error;
-      let result = data as Customer[];
-
-      // Client-side search by name or phone (normalised)
-      if (search.trim()) {
-        const norm = normalizePhone(search);
-        const lower = search.toLowerCase();
-        result = result.filter(
-          (c) =>
-            (c.name?.toLowerCase().includes(lower) ?? false) ||
-            c.phone_normalized.includes(norm) ||
-            (c.phone_display?.includes(search) ?? false)
-        );
+      if (debouncedSearch.trim()) {
+        const { data: matches, error: searchError } = await supabase.rpc("search_customer_ids", { p_search: debouncedSearch.trim() });
+        if (searchError) throw searchError;
+        const ids = Array.isArray(matches) ? matches.map(row => typeof row === "string" ? row : (row as { id?: string }).id).filter((id): id is string => Boolean(id)) : [];
+        q = q.in("id", ids.length ? ids : ["00000000-0000-0000-0000-000000000000"]);
       }
 
-      return result;
+      const { data, error } = await q;
+      if (error) throw error;
+      return data as Customer[];
     },
   });
 

@@ -3,7 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth";
-import { PageContainer, EmptyState, StatusBadge } from "@/components/ui-shared";
+import { PageContainer, EmptyState, RetryableError, StatusBadge } from "@/components/ui-shared";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -44,22 +44,11 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import type { Sale, Payment, Subscription, Renewal, Customer, Profile } from "@/lib/types";
+import { requireSingleRpcRow, SALE_FINANCIAL_DETAIL_FIELDS, type SaleFinancialDetail } from "@/lib/data-safety";
 
 interface SaleDetail extends Sale {
   customer: Customer | null;
   created_by_profile: Profile | null;
-}
-
-interface FinancialDetail {
-  total_price: number;
-  total_paid: number;
-  refund_amount: number;
-  outstanding: number;
-  net_collected: number;
-  cost_price: number;
-  payment_fee: number;
-  gross_profit: number;
-  margin_pct: number;
 }
 
 export function SaleDetailsPage() {
@@ -82,14 +71,14 @@ export function SaleDetailsPage() {
     enabled: !!id,
   });
 
-  const { data: financial } = useQuery({
+  const { data: financial, isError: financialError, refetch: retryFinancial } = useQuery({
     queryKey: ["sale-financial-detail", id],
     queryFn: async () => {
       const { data, error } = await supabase.rpc("sale_financial_detail", {
         p_sale_id: id!,
       });
       if (error) throw error;
-      return data as FinancialDetail;
+      return requireSingleRpcRow<SaleFinancialDetail>(data, "Sale financial detail", SALE_FINANCIAL_DETAIL_FIELDS);
     },
     enabled: !!id,
   });
@@ -164,6 +153,8 @@ export function SaleDetailsPage() {
       queryClient.invalidateQueries({ queryKey: ["sale-financial-detail", id] });
       queryClient.invalidateQueries({ queryKey: ["sales"] });
       queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard-financial-stats"] });
+      queryClient.invalidateQueries({ queryKey: ["financial-reports"] });
       setAddPayAmount("");
       setAddPayMethod("");
       setAddPayRef("");
@@ -179,6 +170,9 @@ export function SaleDetailsPage() {
       queryClient.invalidateQueries({ queryKey: ["sale-payments", id] });
       queryClient.invalidateQueries({ queryKey: ["sale-financial-detail", id] });
       queryClient.invalidateQueries({ queryKey: ["sales"] });
+      queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard-financial-stats"] });
+      queryClient.invalidateQueries({ queryKey: ["financial-reports"] });
     },
   });
 
@@ -274,6 +268,7 @@ export function SaleDetailsPage() {
   return (
     <PageContainer>
       <div className="flex flex-col gap-6">
+        {financialError && <RetryableError message="Sale financial details could not be loaded. Retry before relying on balances or profit." onRetry={() => void retryFinancial()} />}
         {/* Header */}
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -379,7 +374,8 @@ export function SaleDetailsPage() {
                   <div className="flex justify-between"><span className="text-muted-foreground">Selling Price</span><span className="font-medium">{formatMoney(financial?.total_price ?? sale.final_selling_price)}</span></div>
                   {sale.list_price_snapshot != null && <div className="flex justify-between"><span className="text-muted-foreground">List Price</span><span>{formatMoney(sale.list_price_snapshot)}</span></div>}
                   <div className="flex justify-between"><span className="text-muted-foreground">Paid</span><span className="font-medium text-success">{formatMoney(financial?.total_paid ?? 0)}</span></div>
-                  {(financial?.refund_amount ?? sale.refund_amount) > 0 && <div className="flex justify-between"><span className="text-muted-foreground">Refunded</span><span className="font-medium text-destructive">{formatMoney(financial?.refund_amount ?? sale.refund_amount)}</span></div>}
+                  {(financial?.cash_refunded ?? sale.refund_amount) > 0 && <div className="flex justify-between"><span className="text-muted-foreground">Cash Refunded</span><span className="font-medium text-destructive">{formatMoney(financial?.cash_refunded ?? sale.refund_amount)}</span></div>}
+                  {(financial?.balance_adjusted ?? 0) > 0 && <div className="flex justify-between"><span className="text-muted-foreground">Balance Adjusted</span><span className="font-medium">{formatMoney(financial?.balance_adjusted ?? 0)}</span></div>}
                   {(financial?.outstanding ?? 0) > 0 && <div className="flex justify-between border-t pt-1"><span className="font-medium text-warning">Outstanding</span><span className="font-semibold text-warning">{formatMoney(financial?.outstanding ?? 0)}</span></div>}
                   <div className="flex justify-between"><span className="text-muted-foreground">Net Collected</span><span className="font-medium">{formatMoney(financial?.net_collected ?? 0)}</span></div>
                 </div>

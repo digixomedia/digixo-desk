@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useParams, useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
-import { PageContainer, EmptyState, StatusBadge } from "@/components/ui-shared";
+import { PageContainer, EmptyState, RetryableError, StatusBadge } from "@/components/ui-shared";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { formatMoney, formatDate, formatDateTime } from "@/lib/format";
 import type { Customer, Sale, Payment, Subscription, Renewal } from "@/lib/types";
+import { FINANCIAL_SUMMARY_FIELDS, type FinancialSummary, requireSingleRpcRow } from "@/lib/data-safety";
 
 export function CustomerProfilePage() {
   const { id } = useParams<{ id: string }>();
@@ -95,21 +96,14 @@ export function CustomerProfilePage() {
     enabled: !!id,
   });
 
-  const { data: financial } = useQuery({
+  const { data: financial, isLoading: financialLoading, isError: financialError, refetch: retryFinancial } = useQuery({
     queryKey: ["customer-financial-summary", id],
     queryFn: async () => {
       const { data, error } = await supabase.rpc("customer_financial_summary", {
         p_customer_id: id!,
       });
       if (error) throw error;
-      return data as {
-        total_order_value: number;
-        cash_collected: number;
-        outstanding: number;
-        refund_total: number;
-        net_collected: number;
-        sale_count: number;
-      };
+      return requireSingleRpcRow<FinancialSummary>(data, "Customer financial summary", FINANCIAL_SUMMARY_FIELDS);
     },
     enabled: !!id,
   });
@@ -135,10 +129,10 @@ export function CustomerProfilePage() {
   }
 
   // Financial metrics from server RPC
-  const totalOrderValue = financial?.total_order_value ?? 0;
-  const amountPaid = financial?.cash_collected ?? 0;
-  const outstanding = financial?.outstanding ?? 0;
-  const netCollected = financial?.net_collected ?? 0;
+  const totalOrderValue = financial?.total_order_value;
+  const amountPaid = financial?.cash_collected;
+  const outstanding = financial?.outstanding;
+  const netCollected = financial?.net_collected;
 
   const lastPurchase = sales?.[0];
 
@@ -155,6 +149,7 @@ export function CustomerProfilePage() {
   return (
     <PageContainer>
       <div className="flex flex-col gap-6">
+        {financialError && <RetryableError message="Customer balances could not be loaded. Financial values are hidden until the request succeeds." onRetry={() => void retryFinancial()} />}
         {/* Breadcrumb + header */}
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="icon" onClick={() => navigate("/customers")}>
@@ -231,25 +226,25 @@ export function CustomerProfilePage() {
           <Card>
             <CardContent className="p-4">
               <p className="text-xs text-muted-foreground">Total Order Value</p>
-              <p className="text-lg font-semibold">{formatMoney(totalOrderValue)}</p>
+              <p className="text-lg font-semibold">{financialLoading ? "Loading…" : totalOrderValue === undefined ? "—" : formatMoney(totalOrderValue)}</p>
             </CardContent>
           </Card>
           <Card>
             <CardContent className="p-4">
               <p className="text-xs text-muted-foreground">Amount Paid</p>
-              <p className="text-lg font-semibold text-success">{formatMoney(amountPaid)}</p>
+              <p className="text-lg font-semibold text-success">{financialLoading ? "Loading…" : amountPaid === undefined ? "—" : formatMoney(amountPaid)}</p>
             </CardContent>
           </Card>
           <Card>
             <CardContent className="p-4">
               <p className="text-xs text-muted-foreground">Outstanding</p>
-              <p className={`text-lg font-semibold ${outstanding > 0 ? "text-warning" : ""}`}>{formatMoney(outstanding)}</p>
+              <p className={`text-lg font-semibold ${(outstanding ?? 0) > 0 ? "text-warning" : ""}`}>{financialLoading ? "Loading…" : outstanding === undefined ? "—" : formatMoney(outstanding)}</p>
             </CardContent>
           </Card>
           <Card>
             <CardContent className="p-4">
               <p className="text-xs text-muted-foreground">Net Collected</p>
-              <p className="text-lg font-semibold">{formatMoney(netCollected)}</p>
+              <p className="text-lg font-semibold">{financialLoading ? "Loading…" : netCollected === undefined ? "—" : formatMoney(netCollected)}</p>
             </CardContent>
           </Card>
         </div>

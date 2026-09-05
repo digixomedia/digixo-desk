@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/lib/auth";
-import { PageContainer, PageHeader, EmptyState, StatusBadge } from "@/components/ui-shared";
+import { PageContainer, PageHeader, EmptyState, RetryableError, StatusBadge } from "@/components/ui-shared";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -41,8 +41,18 @@ import {
   RotateCcw,
   ExternalLink,
 } from "lucide-react";
-import { formatMoney, formatDate, formatDateTime, normalizePhone } from "@/lib/format";
+import { formatMoney, formatDate, formatDateTime } from "@/lib/format";
 import type { Sale, Payment } from "@/lib/types";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
+import {
+  currentIstMonthRange,
+  currentIstDate,
+  FINANCIAL_SUMMARY_FIELDS,
+  type FinancialSummary,
+  requireSingleRpcRow,
+  SALE_FINANCIAL_DETAIL_FIELDS,
+  type SaleFinancialDetail,
+} from "@/lib/data-safety";
 
 const PAGE_SIZE = 20;
 
@@ -55,9 +65,12 @@ export function SalesPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search);
   const [payStatus, setPayStatus] = useState<string>(searchParams.get("pay") || "all");
   const [fulfilStatus, setFulfilStatus] = useState<string>(searchParams.get("fulfil") || "all");
   const [page, setPage] = useState(0);
+  const [dateFrom, setDateFrom] = useState<string | null>(null);
+  const [dateToExclusive, setDateToExclusive] = useState<string | null>(null);
   const [sortField, setSortField] = useState<SortField>("sale_date");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [selectedSaleId, setSelectedSaleId] = useState<string | null>(
@@ -73,18 +86,32 @@ export function SalesPage() {
   }, [searchParams]);
 
   const { data: salesData, isLoading } = useQuery({
-    queryKey: ["sales-paginated", search, payStatus, fulfilStatus, page, sortField, sortDir],
+    queryKey: ["sales-paginated", debouncedSearch, payStatus, fulfilStatus, dateFrom, dateToExclusive, page, sortField, sortDir],
     queryFn: async () => {
       const from = page * PAGE_SIZE;
       const to = from + PAGE_SIZE - 1;
 
       let countQuery = supabase
         .from("sales")
-        .select("id, final_selling_price", { count: "exact" });
+        .select("id, final_selling_price", { count: "exact" })
+        .eq("is_demo", false);
 
       let dataQuery = supabase
         .from("sales")
-        .select("*, customer:customers(*), created_by_profile:profiles!sales_created_by_fkey(*)");
+        .select("*, customer:customers(*), created_by_profile:profiles!sales_created_by_fkey(*)")
+        .eq("is_demo", false);
+
+      const searchTerm = debouncedSearch.trim();
+      if (searchTerm) {
+        const { data: matches, error: searchError } = await supabase.rpc("search_sale_ids", { p_search: searchTerm });
+        if (searchError) throw searchError;
+        const ids = Array.isArray(matches)
+          ? matches.map((row) => (typeof row === "string" ? row : (row as { id?: string }).id)).filter((id): id is string => Boolean(id))
+          : [];
+        const safeIds = ids.length > 0 ? ids : ["00000000-0000-0000-0000-000000000000"];
+        countQuery = countQuery.in("id", safeIds);
+        dataQuery = dataQuery.in("id", safeIds);
+      }
 
       if (payStatus !== "all") {
         countQuery = countQuery.eq("payment_status", payStatus);
@@ -94,15 +121,13 @@ export function SalesPage() {
         countQuery = countQuery.eq("fulfilment_status", fulfilStatus);
         dataQuery = dataQuery.eq("fulfilment_status", fulfilStatus);
       }
-      if (search.trim()) {
-        const lower = search.toLowerCase();
-        const norm = normalizePhone(search);
-        const orFilter = `sale_number.ilike.%${lower}%,product_name_snapshot.ilike.%${lower}%`;
-        countQuery = countQuery.or(orFilter);
-        dataQuery = dataQuery.or(orFilter);
-        if (norm) {
-          dataQuery = dataQuery.or(`customer.phone_normalized.ilike.%${norm}%`);
-        }
+      if (dateFrom) {
+        countQuery = countQuery.gte("sale_date", dateFrom);
+        dataQuery = dataQuery.gte("sale_date", dateFrom);
+      }
+      if (dateToExclusive) {
+        countQuery = countQuery.lt("sale_date", dateToExclusive);
+        dataQuery = dataQuery.lt("sale_date", dateToExclusive);
       }
 
       dataQuery = dataQuery
@@ -126,23 +151,18 @@ export function SalesPage() {
   });
 
   // Accurate financial summary from server
-  const { data: summary } = useQuery({
-    queryKey: ["sales-financial-summary", search, payStatus, fulfilStatus],
+  const { data: summary, isLoading: summaryLoading, isError: summaryError, refetch: retrySummary } = useQuery({
+    queryKey: ["sales-financial-summary", debouncedSearch, payStatus, fulfilStatus, dateFrom, dateToExclusive],
     queryFn: async () => {
       const { data, error } = await supabase.rpc("sales_financial_summary", {
-        p_search: search.trim() || null,
+        p_search: debouncedSearch.trim() || null,
         p_payment_status: payStatus === "all" ? null : payStatus,
         p_fulfilment_status: fulfilStatus === "all" ? null : fulfilStatus,
+        p_from: dateFrom,
+        p_to_exclusive: dateToExclusive,
       });
       if (error) throw error;
-      return data as {
-        total_order_value: number;
-        cash_collected: number;
-        outstanding: number;
-        refund_total: number;
-        net_collected: number;
-        sale_count: number;
-      };
+      return requireSingleRpcRow<FinancialSummary>(data, "Sales financial summary", FINANCIAL_SUMMARY_FIELDS);
     },
   });
 
@@ -162,24 +182,14 @@ export function SalesPage() {
     enabled: !!selectedSaleId,
   });
 
-  const { data: financialDetail } = useQuery({
+  const { data: financialDetail, isError: financialDetailError, refetch: retryFinancialDetail } = useQuery({
     queryKey: ["sale-financial-detail", selectedSaleId],
     queryFn: async () => {
       const { data, error } = await supabase.rpc("sale_financial_detail", {
         p_sale_id: selectedSaleId!,
       });
       if (error) throw error;
-      return data as {
-        total_price: number;
-        total_paid: number;
-        refund_amount: number;
-        outstanding: number;
-        net_collected: number;
-        cost_price: number;
-        payment_fee: number;
-        gross_profit: number;
-        margin_pct: number;
-      };
+      return requireSingleRpcRow<SaleFinancialDetail>(data, "Sale financial detail", SALE_FINANCIAL_DETAIL_FIELDS);
     },
     enabled: !!selectedSaleId,
   });
@@ -187,7 +197,7 @@ export function SalesPage() {
   const [addPayAmount, setAddPayAmount] = useState("");
   const [addPayMethod, setAddPayMethod] = useState("");
   const [addPayRef, setAddPayRef] = useState("");
-  const [addPayDate, setAddPayDate] = useState(new Date().toISOString().slice(0, 10));
+  const [addPayDate, setAddPayDate] = useState(currentIstDate());
 
   const addPayment = useMutation({
     mutationFn: async () => {
@@ -212,6 +222,8 @@ export function SalesPage() {
       queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
       queryClient.invalidateQueries({ queryKey: ["customer-payments"] });
       queryClient.invalidateQueries({ queryKey: ["customer-financial-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard-financial-stats"] });
+      queryClient.invalidateQueries({ queryKey: ["financial-reports"] });
       setAddPayAmount("");
       setAddPayMethod("");
       setAddPayRef("");
@@ -234,6 +246,8 @@ export function SalesPage() {
       queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
       queryClient.invalidateQueries({ queryKey: ["customer-payments"] });
       queryClient.invalidateQueries({ queryKey: ["customer-financial-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard-financial-stats"] });
+      queryClient.invalidateQueries({ queryKey: ["financial-reports"] });
       toast.success("Payment reversed");
     },
     onError: (err: Error) => toast.error(err.message),
@@ -281,14 +295,22 @@ export function SalesPage() {
   };
 
   const quickFilters = [
-    { label: "Pending Payment", pay: "pending", fulfil: "all" },
-    { label: "Activation Pending", pay: "all", fulfil: "activation_pending" },
-    { label: "This Month", pay: "all", fulfil: "all" },
+    { label: "Pending Payment", pay: "pending", fulfil: "all", month: false },
+    { label: "Activation Pending", pay: "all", fulfil: "activation_pending", month: false },
+    { label: "This Month", pay: "all", fulfil: "all", month: true },
   ];
 
-  const applyQuickFilter = (pay: string, fulfil: string) => {
+  const applyQuickFilter = (pay: string, fulfil: string, month: boolean) => {
     setPayStatus(pay);
     setFulfilStatus(fulfil);
+    if (month) {
+      const range = currentIstMonthRange();
+      setDateFrom(range.from);
+      setDateToExclusive(range.toExclusive);
+    } else {
+      setDateFrom(null);
+      setDateToExclusive(null);
+    }
     setPage(0);
   };
 
@@ -299,27 +321,29 @@ export function SalesPage() {
       <div className="flex flex-col gap-4">
         <PageHeader title="Sales" description="Browse, search and manage all sales" />
 
+        {summaryError && <RetryableError message="Sales totals could not be loaded. Values are hidden to avoid showing misleading zeroes." onRetry={() => void retrySummary()} />}
+
         {/* Summary bar */}
         <div className="flex flex-wrap items-center gap-4 rounded-lg border bg-muted/30 px-4 py-3">
           <div className="flex items-center gap-2">
             <ShoppingCart className="h-4 w-4 text-muted-foreground" />
             <span className="text-sm text-muted-foreground">Sales:</span>
-            <span className="text-sm font-semibold">{summary?.sale_count ?? 0}</span>
+            <span className="text-sm font-semibold">{summaryLoading ? "Loading…" : summary ? summary.sale_count : "—"}</span>
           </div>
           <div className="flex items-center gap-2">
             <IndianRupee className="h-4 w-4 text-muted-foreground" />
             <span className="text-sm text-muted-foreground">Order Value:</span>
-            <span className="text-sm font-semibold">{formatMoney(summary?.total_order_value ?? 0)}</span>
+            <span className="text-sm font-semibold">{summaryLoading ? "Loading…" : summary ? formatMoney(summary.total_order_value) : "—"}</span>
           </div>
           <div className="flex items-center gap-2">
             <CheckCircle2 className="h-4 w-4 text-muted-foreground" />
             <span className="text-sm text-muted-foreground">Collected:</span>
-            <span className="text-sm font-semibold text-success">{formatMoney(summary?.cash_collected ?? 0)}</span>
+            <span className="text-sm font-semibold text-success">{summaryLoading ? "Loading…" : summary ? formatMoney(summary.cash_collected) : "—"}</span>
           </div>
           <div className="flex items-center gap-2">
             <Clock className="h-4 w-4 text-muted-foreground" />
             <span className="text-sm text-muted-foreground">Outstanding:</span>
-            <span className="text-sm font-semibold text-warning">{formatMoney(summary?.outstanding ?? 0)}</span>
+            <span className="text-sm font-semibold text-warning">{summaryLoading ? "Loading…" : summary ? formatMoney(summary.outstanding) : "—"}</span>
           </div>
           {summary && summary.refund_total > 0 && (
             <div className="flex items-center gap-2">
@@ -333,25 +357,29 @@ export function SalesPage() {
         {/* Quick filter buttons */}
         <div className="flex flex-wrap gap-2">
           {quickFilters.map((filter) => {
-            const active = payStatus === filter.pay && fulfilStatus === filter.fulfil;
+            const monthRange = currentIstMonthRange();
+            const active = payStatus === filter.pay && fulfilStatus === filter.fulfil &&
+              (filter.month ? dateFrom === monthRange.from && dateToExclusive === monthRange.toExclusive : !dateFrom && !dateToExclusive);
             return (
               <Button
                 key={filter.label}
                 size="sm"
                 variant={active ? "default" : "outline"}
-                onClick={() => applyQuickFilter(filter.pay, filter.fulfil)}
+                onClick={() => applyQuickFilter(filter.pay, filter.fulfil, filter.month)}
               >
                 {filter.label}
               </Button>
             );
           })}
-          {(payStatus !== "all" || fulfilStatus !== "all") && (
+          {(payStatus !== "all" || fulfilStatus !== "all" || dateFrom || dateToExclusive) && (
             <Button
               size="sm"
               variant="ghost"
               onClick={() => {
                 setPayStatus("all");
                 setFulfilStatus("all");
+                setDateFrom(null);
+                setDateToExclusive(null);
                 setPage(0);
               }}
             >
@@ -571,6 +599,7 @@ export function SalesPage() {
                 </div>
 
                 {/* Payment summary */}
+                {financialDetailError && <RetryableError message="Sale balances could not be loaded. Retry before relying on these figures." onRetry={() => void retryFinancialDetail()} />}
                 <div className="rounded-lg border p-3">
                   <div className="flex items-center justify-between">
                     <p className="text-xs font-medium text-muted-foreground">Payment Summary</p>

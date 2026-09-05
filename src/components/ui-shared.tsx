@@ -62,6 +62,17 @@ export function EmptyState({
   );
 }
 
+export function RetryableError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3">
+      <p className="text-sm text-destructive">{message}</p>
+      <button type="button" onClick={onRetry} className="rounded-md border border-destructive/30 px-3 py-1 text-sm font-medium text-destructive hover:bg-destructive/10">
+        Retry
+      </button>
+    </div>
+  );
+}
+
 const STATUS_STYLES: Record<string, string> = {
   pending: "bg-warning/10 text-warning border-warning/20",
   partial: "bg-info/10 text-info border-info/20",
