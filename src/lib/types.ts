@@ -234,6 +234,20 @@ export interface ActivityLog {
   user?: Profile | null;
 }
 
+export interface Expense {
+  id: string;
+  expense_date: string;
+  category: string;
+  description: string | null;
+  amount: number;
+  payment_method: string | null;
+  reference: string | null;
+  created_by: string | null;
+  created_at: string;
+  archived_at: string | null;
+  is_demo: boolean;
+}
+
 export interface OwnerDashboardStats {
   revenue_this_month: number;
   cash_received_this_month: number;

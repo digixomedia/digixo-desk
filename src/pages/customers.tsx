@@ -25,9 +25,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "sonner";
-import { Plus, Users, Search } from "lucide-react";
+import { Plus, Users, Search, Archive, ArchiveRestore, Trash2, EyeOff } from "lucide-react";
 import { normalizePhone, formatDate } from "@/lib/format";
 import type { Customer, CustomerType, AcquisitionSource, Profile } from "@/lib/types";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 export function CustomersPage() {
   const { profile } = useAuth();
@@ -37,6 +47,9 @@ export function CustomersPage() {
   const [search, setSearch] = useState(searchParams.get("q") ?? "");
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [createOpen, setCreateOpen] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [archiveTarget, setArchiveTarget] = useState<Customer | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Customer | null>(null);
 
   // Form state
   const [fName, setFName] = useState("");
@@ -56,13 +69,18 @@ export function CustomersPage() {
   });
 
   const { data: customers, isLoading } = useQuery({
-    queryKey: ["customers", search, typeFilter],
+    queryKey: ["customers", search, typeFilter, showArchived],
     queryFn: async () => {
       let q = supabase
         .from("customers")
         .select("*")
-        .is("archived_at", null)
         .order("created_at", { ascending: false });
+
+      if (showArchived) {
+        q = q.not("archived_at", "is", null);
+      } else {
+        q = q.is("archived_at", null);
+      }
 
       if (typeFilter !== "all") {
         q = q.eq("customer_type", typeFilter);
@@ -125,6 +143,45 @@ export function CustomersPage() {
     onError: (err: Error) => toast.error(err.message),
   });
 
+  const archiveMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("archive_record", { p_table: "customers", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["customers"] });
+      queryClient.invalidateQueries({ queryKey: ["customer-financial-summary"] });
+      setArchiveTarget(null);
+      toast.success("Customer archived");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const restoreMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("restore_record", { p_table: "customers", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["customers"] });
+      toast.success("Customer restored");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const hardDeleteMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("hard_delete_record", { p_table: "customers", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["customers"] });
+      setDeleteTarget(null);
+      toast.success("Customer permanently deleted");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
   const resetForm = () => {
     setFName("");
     setFPhone("");
@@ -141,9 +198,15 @@ export function CustomersPage() {
           title="Customers"
           description="Search and manage your customer base"
           actions={
-            <Button size="sm" onClick={() => { setCreateOpen(true); resetForm(); }}>
-              <Plus className="mr-1.5 h-4 w-4" /> New Customer
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={() => setShowArchived((v) => !v)}>
+                {showArchived ? <EyeOff className="mr-1.5 h-4 w-4" /> : <Archive className="mr-1.5 h-4 w-4" />}
+                {showArchived ? "Active" : "Archived"}
+              </Button>
+              <Button size="sm" onClick={() => { setCreateOpen(true); resetForm(); }}>
+                <Plus className="mr-1.5 h-4 w-4" /> New Customer
+              </Button>
+            </div>
           }
         />
 
@@ -212,6 +275,20 @@ export function CustomersPage() {
                         {assigned && <p className="text-xs text-muted-foreground">Assigned: {assigned.full_name}</p>}
                       </div>
                       <StatusBadge status={c.customer_type} />
+                      {showArchived ? (
+                        <div className="flex items-center gap-1">
+                          <Button variant="ghost" size="icon" title="Restore" onClick={(e) => { e.stopPropagation(); restoreMutation.mutate(c.id); }}>
+                            <ArchiveRestore className="h-4 w-4" />
+                          </Button>
+                          <Button variant="ghost" size="icon" title="Delete permanently" onClick={(e) => { e.stopPropagation(); setDeleteTarget(c); }}>
+                            <Trash2 className="h-4 w-4 text-destructive" />
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button variant="ghost" size="icon" title="Archive" onClick={(e) => { e.stopPropagation(); setArchiveTarget(c); }}>
+                          <Archive className="h-4 w-4" />
+                        </Button>
+                      )}
                     </div>
                   </CardContent>
                 </Card>
@@ -282,6 +359,48 @@ export function CustomersPage() {
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Archive confirmation */}
+      <AlertDialog open={!!archiveTarget} onOpenChange={(open) => !open && setArchiveTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Archive customer?</AlertDialogTitle>
+            <AlertDialogDescription>
+              "{archiveTarget?.name ?? archiveTarget?.phone_display}" will be hidden from your active list. Their sales and payment history are preserved. You can restore them from the Archived view.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => archiveTarget && archiveMutation.mutate(archiveTarget.id)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Archive
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Hard delete confirmation */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Permanently delete customer?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This cannot be undone. "{deleteTarget?.name ?? deleteTarget?.phone_display}" will be permanently removed. This only works if the customer has no sales records. If they do, archive instead.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => deleteTarget && hardDeleteMutation.mutate(deleteTarget.id)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete Permanently
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </PageContainer>
   );
 }

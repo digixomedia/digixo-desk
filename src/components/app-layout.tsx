@@ -16,6 +16,7 @@ import {
   BarChart3,
   Download,
   RotateCcw,
+  Receipt,
   KeyRound,
   Settings,
   ChevronRight,
@@ -96,6 +97,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: "Financial Reports", to: "/finance/reports", icon: <BarChart3 className="h-4 w-4" /> },
       { label: "Refunds", to: "/finance/refunds", icon: <RotateCcw className="h-4 w-4" /> },
+      { label: "Expenses", to: "/finance/expenses", icon: <Receipt className="h-4 w-4" />, ownerOnly: true },
       { label: "Export Data", to: "/finance/export", icon: <Download className="h-4 w-4" /> },
     ],
   },

@@ -17,6 +17,7 @@ import { RenewalsPage } from "@/pages/renewals";
 import { FinancialReportsPage } from "@/pages/financial-reports";
 import { ExportDataPage } from "@/pages/export-data";
 import { RefundsPage } from "@/pages/refunds";
+import { ExpensesPage } from "@/pages/expenses";
 import { DemoDataPage } from "@/pages/demo-data";
 import { IntegrationsPage } from "@/pages/integrations";
 import { SettingsPage } from "@/pages/settings";
@@ -48,6 +49,7 @@ export function App() {
                       <Route path="/finance/reports" element={<FinancialReportsPage />} />
                       <Route path="/finance/export" element={<ExportDataPage />} />
                       <Route path="/finance/refunds" element={<RefundsPage />} />
+                      <Route path="/finance/expenses" element={<RequireOwner><ExpensesPage /></RequireOwner>} />
                       <Route path="/demo" element={<DemoDataPage />} />
                       <Route path="/integrations" element={<RequireOwner><IntegrationsPage /></RequireOwner>} />
                       <Route path="/settings" element={<SettingsPage />} />

@@ -34,9 +34,19 @@ import {
   SheetFooter,
 } from "@/components/ui/sheet";
 import { toast } from "sonner";
-import { Plus, Package, Pencil, Archive, ChevronRight, History } from "lucide-react";
+import { Plus, Package, Pencil, Archive, ArchiveRestore, Trash2, ChevronRight, History, EyeOff } from "lucide-react";
 import { formatMoney, formatDate } from "@/lib/format";
 import type { Product, ProductPlan, Category, ProductPriceHistory, PurchaseType } from "@/lib/types";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 export function ProductsPage() {
   const { profile, isOwner } = useAuth();
@@ -45,6 +55,8 @@ export function ProductsPage() {
   const [editing, setEditing] = useState<Product | null>(null);
   const [planPanel, setPlanPanel] = useState<Product | null>(null);
   const [priceHistoryFor, setPriceHistoryFor] = useState<ProductPlan | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Product | null>(null);
 
   // Form state
   const [name, setName] = useState("");
@@ -160,15 +172,37 @@ export function ProductsPage() {
 
   const archiveProduct = useMutation({
     mutationFn: async (id: string) => {
-      const { error } = await supabase
-        .from("products")
-        .update({ archived_at: new Date().toISOString(), is_active: false })
-        .eq("id", id);
+      const { error } = await supabase.rpc("archive_record", { p_table: "products", p_record_id: id });
       if (error) throw error;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["products"] });
       toast.success("Product archived");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const restoreProduct = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("restore_record", { p_table: "products", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+      toast.success("Product restored");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const hardDeleteProduct = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("hard_delete_record", { p_table: "products", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+      setDeleteTarget(null);
+      toast.success("Product permanently deleted");
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -290,9 +324,15 @@ export function ProductsPage() {
           title="Products & Plans"
           description="Manage your product catalog with multiple plans per product"
           actions={
-            <Button size="sm" onClick={() => { setCreateOpen(true); resetForm(); }}>
-              <Plus className="mr-1.5 h-4 w-4" /> New Product
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={() => setShowArchived((v) => !v)}>
+                {showArchived ? <EyeOff className="mr-1.5 h-4 w-4" /> : <Archive className="mr-1.5 h-4 w-4" />}
+                {showArchived ? "Active" : "Archived"}
+              </Button>
+              <Button size="sm" onClick={() => { setCreateOpen(true); resetForm(); }}>
+                <Plus className="mr-1.5 h-4 w-4" /> New Product
+              </Button>
+            </div>
           }
         />
 
@@ -345,16 +385,26 @@ export function ProductsPage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
-                    <Button variant="ghost" size="sm" onClick={() => { setPlanPanel(p); resetPlanForm(); setPlanEditing(null); }}>
-                      Plans <ChevronRight className="ml-1 h-4 w-4" />
-                    </Button>
-                    {!p.archived_at && (
+                    {!p.archived_at && !showArchived && (
                       <>
+                        <Button variant="ghost" size="sm" onClick={() => { setPlanPanel(p); resetPlanForm(); setPlanEditing(null); }}>
+                          Plans <ChevronRight className="ml-1 h-4 w-4" />
+                        </Button>
                         <Button variant="ghost" size="icon" onClick={() => openEdit(p)}>
                           <Pencil className="h-4 w-4" />
                         </Button>
                         <Button variant="ghost" size="icon" onClick={() => archiveProduct.mutate(p.id)}>
                           <Archive className="h-4 w-4" />
+                        </Button>
+                      </>
+                    )}
+                    {p.archived_at && showArchived && (
+                      <>
+                        <Button variant="ghost" size="icon" title="Restore" onClick={() => restoreProduct.mutate(p.id)}>
+                          <ArchiveRestore className="h-4 w-4" />
+                        </Button>
+                        <Button variant="ghost" size="icon" title="Delete permanently" onClick={() => setDeleteTarget(p)}>
+                          <Trash2 className="h-4 w-4 text-destructive" />
                         </Button>
                       </>
                     )}
@@ -549,6 +599,27 @@ export function ProductsPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* Hard delete confirmation */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Permanently delete product?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This cannot be undone. "{deleteTarget?.name}" and all its plans will be permanently removed. This only works if no sales reference this product. If they do, archive instead.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => deleteTarget && hardDeleteProduct.mutate(deleteTarget.id)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete Permanently
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </PageContainer>
   );
 }

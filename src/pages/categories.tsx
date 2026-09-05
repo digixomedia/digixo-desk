@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/dialog";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
-import { Plus, Tag, Pencil, Archive } from "lucide-react";
+import { Plus, Tag, Pencil, Archive, ArchiveRestore, Trash2, EyeOff } from "lucide-react";
 import type { Category } from "@/lib/types";
 
 const COLOURS = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#06b6d4", "#8b5cf6", "#ec4899", "#14b8a6"];
@@ -29,6 +29,8 @@ export function CategoriesPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<Category | null>(null);
   const [archiveTarget, setArchiveTarget] = useState<Category | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Category | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
   const [name, setName] = useState("");
   const [colour, setColour] = useState(COLOURS[0]);
 
@@ -81,16 +83,38 @@ export function CategoriesPage() {
 
   const archiveMutation = useMutation({
     mutationFn: async (id: string) => {
-      const { error } = await supabase
-        .from("categories")
-        .update({ archived_at: new Date().toISOString() })
-        .eq("id", id);
+      const { error } = await supabase.rpc("archive_record", { p_table: "categories", p_record_id: id });
       if (error) throw error;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["categories"] });
       setArchiveTarget(null);
       toast.success("Category archived");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const restoreMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("restore_record", { p_table: "categories", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["categories"] });
+      toast.success("Category restored");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const hardDeleteMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase.rpc("hard_delete_record", { p_table: "categories", p_record_id: id });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["categories"] });
+      setDeleteTarget(null);
+      toast.success("Category permanently deleted");
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -124,9 +148,15 @@ export function CategoriesPage() {
           title="Categories"
           description="Organise your products into colour-coded categories"
           actions={
-            <Button size="sm" onClick={openCreate}>
-              <Plus className="mr-1.5 h-4 w-4" /> New Category
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={() => setShowArchived((v) => !v)}>
+                {showArchived ? <EyeOff className="mr-1.5 h-4 w-4" /> : <Archive className="mr-1.5 h-4 w-4" />}
+                {showArchived ? "Active" : "Archived"}
+              </Button>
+              <Button size="sm" onClick={openCreate}>
+                <Plus className="mr-1.5 h-4 w-4" /> New Category
+              </Button>
+            </div>
           }
         />
 
@@ -164,13 +194,23 @@ export function CategoriesPage() {
                       )}
                     </div>
                   </div>
-                  {!cat.archived_at && (
+                  {!cat.archived_at && !showArchived && (
                     <div className="flex items-center gap-1">
                       <Button variant="ghost" size="icon" onClick={() => openEdit(cat)}>
                         <Pencil className="h-4 w-4" />
                       </Button>
                       <Button variant="ghost" size="icon" onClick={() => setArchiveTarget(cat)}>
                         <Archive className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  )}
+                  {cat.archived_at && showArchived && (
+                    <div className="flex items-center gap-1">
+                      <Button variant="ghost" size="icon" title="Restore" onClick={() => restoreMutation.mutate(cat.id)}>
+                        <ArchiveRestore className="h-4 w-4" />
+                      </Button>
+                      <Button variant="ghost" size="icon" title="Delete permanently" onClick={() => setDeleteTarget(cat)}>
+                        <Trash2 className="h-4 w-4 text-destructive" />
                       </Button>
                     </div>
                   )}
@@ -265,6 +305,27 @@ export function CategoriesPage() {
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               Archive
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Hard delete confirmation */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Permanently delete category?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This cannot be undone. "{deleteTarget?.name}" will be permanently removed. This only works if no products are assigned to this category. If any are, archive instead.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => deleteTarget && hardDeleteMutation.mutate(deleteTarget.id)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete Permanently
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

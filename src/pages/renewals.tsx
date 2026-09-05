@@ -29,9 +29,20 @@ import {
   CheckCircle2,
   Clock,
   XCircle,
+  Trash2,
 } from "lucide-react";
 import { formatDate, normalizePhone } from "@/lib/format";
 import type { Renewal, Customer, Subscription, ProductPlan, Product } from "@/lib/types";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 const PENDING_STATUSES = [
   "pending",
@@ -89,6 +100,7 @@ export function RenewalsPage() {
   const [snoozeTarget, setSnoozeTarget] = useState<RenewalWithRelations | null>(null);
   const [snoozeDays, setSnoozeDays] = useState("7");
   const [notRenewingTarget, setNotRenewingTarget] = useState<RenewalWithRelations | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<RenewalWithRelations | null>(null);
 
   const { data: renewals, isLoading } = useQuery({
     queryKey: ["renewals", search],
@@ -210,6 +222,20 @@ export function RenewalsPage() {
       queryClient.invalidateQueries({ queryKey: ["renewals"] });
       toast.success("Marked as not renewing");
       setNotRenewingTarget(null);
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const deleteRenewalMutation = useMutation({
+    mutationFn: async (renewalId: string) => {
+      const { error } = await supabase.rpc("hard_delete_record", { p_table: "renewals", p_record_id: renewalId });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["renewals"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard-financial-stats"] });
+      setDeleteTarget(null);
+      toast.success("Renewal deleted");
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -459,6 +485,14 @@ export function RenewalsPage() {
                                 <XCircle className="h-3.5 w-3.5" />
                                 Not Renewing
                               </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="gap-1.5 text-destructive hover:bg-destructive/10"
+                                onClick={() => setDeleteTarget(r)}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
                             </div>
                           </td>
                         </tr>
@@ -551,6 +585,14 @@ export function RenewalsPage() {
                           <XCircle className="h-3.5 w-3.5" />
                           Not Renewing
                         </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="gap-1.5 text-destructive hover:bg-destructive/10"
+                          onClick={() => setDeleteTarget(r)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
                       </div>
                     </CardContent>
                   </Card>
@@ -630,6 +672,27 @@ export function RenewalsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Delete renewal confirmation */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete renewal record?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the renewal for {deleteTarget?.customer?.name ?? "this customer"}. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => deleteTarget && deleteRenewalMutation.mutate(deleteTarget.id)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete Permanently
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </PageContainer>
   );
 }

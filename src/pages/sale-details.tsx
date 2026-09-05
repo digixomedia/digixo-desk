@@ -27,8 +27,22 @@ import {
   Calendar,
   RefreshCw,
   StickyNote,
+  Archive,
+  ArchiveRestore,
+  Trash2,
 } from "lucide-react";
 import { formatMoney, formatDate, formatDateTime } from "@/lib/format";
+import { toast } from "sonner";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import type { Sale, Payment, Subscription, Renewal, Customer, Profile } from "@/lib/types";
 
 interface SaleDetail extends Sale {
@@ -181,6 +195,55 @@ export function SaleDetailsPage() {
     },
   });
 
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [deletePaymentTarget, setDeletePaymentTarget] = useState<Payment | null>(null);
+
+  const archiveSale = useMutation({
+    mutationFn: async () => {
+      const { error } = await supabase.rpc("archive_record", { p_table: "sales", p_record_id: id! });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["sale-detail", id] });
+      queryClient.invalidateQueries({ queryKey: ["sales"] });
+      queryClient.invalidateQueries({ queryKey: ["sales-financial-summary"] });
+      setArchiveOpen(false);
+      toast.success("Sale archived");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const restoreSale = useMutation({
+    mutationFn: async () => {
+      const { error } = await supabase.rpc("restore_record", { p_table: "sales", p_record_id: id! });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["sale-detail", id] });
+      queryClient.invalidateQueries({ queryKey: ["sales"] });
+      toast.success("Sale restored");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const deletePayment = useMutation({
+    mutationFn: async (paymentId: string) => {
+      const { error } = await supabase
+        .from("payments")
+        .delete()
+        .eq("id", paymentId);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["sale-payments", id] });
+      queryClient.invalidateQueries({ queryKey: ["sale-financial-detail", id] });
+      queryClient.invalidateQueries({ queryKey: ["sales"] });
+      setDeletePaymentTarget(null);
+      toast.success("Payment record deleted");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
   if (isLoading) {
     return (
       <PageContainer>
@@ -223,6 +286,15 @@ export function SaleDetailsPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {sale.archived_at ? (
+              <Button variant="outline" size="sm" onClick={() => restoreSale.mutate()} disabled={restoreSale.isPending}>
+                <ArchiveRestore className="mr-1.5 h-4 w-4" /> Restore
+              </Button>
+            ) : (
+              <Button variant="outline" size="sm" onClick={() => setArchiveOpen(true)}>
+                <Archive className="mr-1.5 h-4 w-4" /> Archive
+              </Button>
+            )}
             <Button variant="outline" size="sm" onClick={() => window.print()}>
               <Printer className="mr-1.5 h-4 w-4" /> Print
             </Button>
@@ -350,6 +422,11 @@ export function SaleDetailsPage() {
                           {p.status === "valid" && isOwner && (
                             <Button size="sm" variant="ghost" className="h-6 px-2 text-xs text-destructive" onClick={() => reversePayment.mutate(p.id)} disabled={reversePayment.isPending}>
                               <Undo2 className="mr-1 h-3 w-3" /> Reverse
+                            </Button>
+                          )}
+                          {p.status === "reversed" && isOwner && (
+                            <Button size="sm" variant="ghost" className="h-6 px-2 text-xs text-destructive" onClick={() => setDeletePaymentTarget(p)}>
+                              <Trash2 className="mr-1 h-3 w-3" /> Delete
                             </Button>
                           )}
                         </div>
@@ -493,6 +570,48 @@ export function SaleDetailsPage() {
           </div>
         </div>
       </div>
+
+      {/* Archive confirmation */}
+      <AlertDialog open={archiveOpen} onOpenChange={setArchiveOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Archive sale?</AlertDialogTitle>
+            <AlertDialogDescription>
+              "{sale.sale_number}" will be hidden from the main sales list and dashboard. All payment and refund records are preserved for audit. You can restore it later.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => archiveSale.mutate()}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Archive
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Delete reversed payment confirmation */}
+      <AlertDialog open={!!deletePaymentTarget} onOpenChange={(open) => !open && setDeletePaymentTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete reversed payment?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This reversed payment record of {formatMoney(deletePaymentTarget?.amount ?? 0)} will be permanently removed. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => deletePaymentTarget && deletePayment.mutate(deletePaymentTarget.id)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete Permanently
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </PageContainer>
   );
 }
